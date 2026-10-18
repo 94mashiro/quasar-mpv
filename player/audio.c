@@ -48,11 +48,30 @@ enum {
 
 static void ao_process(struct mp_filter *f);
 
+static bool native_compressed_needs_pcm(struct MPContext *mpctx)
+{
+    struct MPOpts *opts = mpctx->opts;
+    if (!mpctx->ao || strcmp(ao_get_name(mpctx->ao), "avfoundation") != 0)
+        return false;
+    int rate, format;
+    struct mp_chmap channels;
+    ao_get_format(mpctx->ao, &rate, &format, &channels);
+    return af_fmt_is_spdif(format) &&
+        (opts->playback_speed != 1 || opts->playback_pitch != 1 ||
+         (opts->af_settings && opts->af_settings[0].name) ||
+         opts->softvol_volume > 100 || audio_get_gain(mpctx) > 1);
+}
+
 static void update_speed_filters(struct MPContext *mpctx)
 {
     struct ao_chain *ao_c = mpctx->ao_chain;
     if (!ao_c)
         return;
+
+    if (native_compressed_needs_pcm(mpctx)) {
+        ao_request_pcm_fallback(mpctx->ao);
+        return;
+    }
 
     double pitch = mpctx->opts->playback_pitch;
     double speed = mpctx->opts->playback_speed;
@@ -189,6 +208,10 @@ void audio_update_volume(struct MPContext *mpctx)
     if (!ao_c || !ao_c->ao)
         return;
 
+    if (native_compressed_needs_pcm(mpctx)) {
+        ao_request_pcm_fallback(mpctx->ao);
+        return;
+    }
     float gain = audio_get_gain(mpctx);
     ao_set_gain(ao_c->ao, gain);
 }
@@ -447,6 +470,12 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
     mpctx->ao = ao_init_best(mpctx->global, ao_flags, mp_wakeup_core_cb,
                              mpctx, mpctx->encode_lavc_ctx, out_rate,
                              out_format, out_channels);
+
+    if (native_compressed_needs_pcm(mpctx)) {
+        MP_VERBOSE(mpctx, "native Dolby processing requires decoded PCM\n");
+        ao_uninit(mpctx->ao);
+        mpctx->ao = NULL;
+    }
 
     int ao_rate = 0;
     int ao_format = 0;
@@ -772,6 +801,12 @@ void reload_audio_output(struct MPContext *mpctx)
         return;
 
     bool pcm_fallback = ao_query_and_reset_events(mpctx->ao, AO_EVENT_PCM_FALLBACK);
+    // Native compressed output may have already read several seconds ahead,
+    // including demux EOF. Refill the new PCM decoder from the audible position,
+    // not the demuxer's read head. Queue before retiring the old audio clock and
+    // preserve any user seek that is already pending.
+    if (pcm_fallback && mpctx->demuxer && mpctx->demuxer->seekable)
+        issue_refresh_seek(mpctx, MPSEEK_EXACT);
     ao_reset(mpctx->ao);
     uninit_audio_out(mpctx);
     reinit_audio_filters(mpctx); // mostly to issue refresh seek
@@ -796,6 +831,8 @@ void reload_audio_output(struct MPContext *mpctx)
             ao_c->spdif_passthrough = !pcm_fallback;
             ao_c->spdif_failed = pcm_fallback;
             mp_decoder_wrapper_set_spdif_flag(ao_c->track->dec, !pcm_fallback);
+            if (pcm_fallback)
+                reset_audio_state(mpctx);
             if (!mp_decoder_wrapper_reinit(dec)) {
                 MP_ERR(mpctx, "Error reinitializing audio.\n");
                 error_on_track(mpctx, ao_c->track);

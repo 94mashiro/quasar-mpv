@@ -1922,6 +1922,22 @@ static int mp_property_audio_devices(void *ctx, struct m_property *prop,
                                 get_device_entry, list);
 }
 
+static int mp_property_audio_spatialization(void *ctx, struct m_property *p,
+                                          int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (action == M_PROPERTY_GET_TYPE) {
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    }
+    if (!mpctx->ao)
+        return M_PROPERTY_UNAVAILABLE;
+    if (action == M_PROPERTY_GET)
+        return ao_control(mpctx->ao, AOCONTROL_GET_SPATIAL_STATUS, arg) == CONTROL_OK
+            ? M_PROPERTY_OK : M_PROPERTY_UNAVAILABLE;
+    return M_PROPERTY_NOT_IMPLEMENTED;
+}
+
 static int mp_property_ao(void *ctx, struct m_property *p, int action, void *arg)
 {
     MPContext *mpctx = ctx;
@@ -4566,6 +4582,7 @@ static const struct m_property mp_properties_base[] = {
     {"audio-device", mp_property_audio_device},
     {"audio-device-list", mp_property_audio_devices},
     {"current-ao", mp_property_ao},
+    {"avfoundation-audio-spatialization", mp_property_audio_spatialization},
 
     // Video
     {"video-target-params", mp_property_tgt_imgparams},

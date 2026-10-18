@@ -24,6 +24,8 @@
 #include "common/msg.h"
 #include "internal.h"
 #include "options/m_option.h"
+#include "misc/node.h"
+#include "mpv/client.h"
 #include "osdep/timer.h"
 #include "ta/ta_talloc.h"
 
@@ -42,6 +44,7 @@
     struct ao *ao;
 }
 - (void)handleRestartNotification:(NSNotification*)notification;
+- (void)invalidate;
 @end
 
 @interface AVPLoader : NSObject <AVAssetResourceLoaderDelegate> {
@@ -117,6 +120,8 @@ struct priv {
     // AC3/EAC3 opt-in routes through AVPlayer. Disable to let next configured
     // AO handle bitstream.
     bool opt_accept_compressed;
+    int opt_spatial_audio; // 0=off, 1=multichannel, 2=all
+    bool opt_manage_session;
     // ES lead ahead of observed playhead, seconds. Loader reads through write
     // head regardless of lead; Apple consumes ~1.8s quanta. At 2s lead,
     // refills overran write head, skipping ~100-220ms every 1.79s on tvOS
@@ -144,6 +149,16 @@ struct priv {
     double opt_max_lookahead;
 #endif
 };
+
+// Eligibility only: Apple still honors the user's Off/Fixed/Head Tracked choice.
+static AVAudioSpatializationFormats spatial_formats(struct priv *p)
+{
+    switch (p->opt_spatial_audio) {
+    case 0: return AVAudioSpatializationFormatNone;
+    case 1: return AVAudioSpatializationFormatMultichannel;
+    default: return AVAudioSpatializationFormatMonoStereoAndMultichannel;
+    }
+}
 
 #define IEC61937_HEADER_SIZE 8
 #define IEC61937_AC3  0x01
@@ -697,6 +712,8 @@ static void avp_create_item(struct ao *ao)
     p->asset = [[AVURLAsset alloc] initWithURL:url options:nil];
     [p->asset.resourceLoader setDelegate:p->loader queue:p->queue];
     p->item = [[AVPlayerItem alloc] initWithAsset:p->asset];
+    if (@available(tvOS 15.0, iOS 15.0, macOS 12.0, *))
+        p->item.allowedAudioSpatializationFormats = spatial_formats(p);
     p->item.canUseNetworkResourcesForLiveStreamingWhilePaused = YES;
     [p->player replaceCurrentItemWithPlayerItem:p->item];
 
@@ -1049,6 +1066,38 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
 {
     struct priv *p = ao->priv;
 
+    if (cmd == AOCONTROL_GET_SPATIAL_STATUS) {
+        struct mpv_node *node = arg;
+        node_init(node, MPV_FORMAT_NODE_MAP, NULL);
+        node_map_add_string(node, "path", p->spdif ? "avplayer" : "sample-buffer");
+        __block AVAudioSpatializationFormats formats = AVAudioSpatializationFormatNone;
+        __block bool available = false;
+        void (^read_formats)(void) = ^{
+            if (@available(tvOS 15.0, iOS 15.0, macOS 12.0, *)) {
+                available = p->spdif ? p->item != nil : p->renderer != nil;
+                formats = p->spdif ? p->item.allowedAudioSpatializationFormats
+                                  : p->renderer.allowedAudioSpatializationFormats;
+            }
+        };
+        dispatch_sync(p->queue, read_formats);
+        if (available) {
+            node_map_add_flag(node, "allows-stereo", !!(formats & AVAudioSpatializationFormatMonoAndStereo));
+            node_map_add_flag(node, "allows-multichannel", !!(formats & AVAudioSpatializationFormatMultichannel));
+        }
+#if TARGET_OS_IPHONE
+        if (@available(tvOS 15.0, iOS 15.0, *)) {
+            NSArray<AVAudioSessionPortDescription *> *outputs = AVAudioSession.sharedInstance.currentRoute.outputs;
+            if (outputs.count) {
+                bool enabled = false;
+                for (AVAudioSessionPortDescription *port in outputs)
+                    enabled |= port.isSpatialAudioEnabled;
+                node_map_add_flag(node, "route-spatial-enabled", enabled);
+            }
+        }
+#endif
+        return CONTROL_OK;
+    }
+
     if (p->spdif) {
         __block int result = CONTROL_OK;
         void (^control_block)(void) = ^{
@@ -1105,10 +1154,19 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
     return self;
 }
 - (void)handleRestartNotification:(NSNotification*)notification {
-    MP_WARN(ao, "restarting due to system notification; this will cause desync\n");
-    MP_VERBOSE(ao, "notification name: %s\n", notification.name.UTF8String);
-    stop(ao);
-    start(ao);
+    @synchronized(self) {
+        if (!ao)
+            return;
+        MP_VERBOSE(ao, "audio output changed: %s\n", notification.name.UTF8String);
+        // Core performs the flush/reload and restores its paused state. Never
+        // start audio from an arbitrary notification thread or after teardown.
+        ao_request_reload(ao);
+    }
+}
+- (void)invalidate {
+    @synchronized(self) {
+        ao = NULL;
+    }
 }
 @end
 
@@ -1190,16 +1248,25 @@ static int init(struct ao *ao)
     }
 
 #if TARGET_OS_IPHONE
-    // Keep PCM setup. Compressed path uses host's shared session without
-    // changing or deactivating it.
-    if (!spdif) {
-        AVAudioSession *instance = AVAudioSession.sharedInstance;
-        NSInteger maxChannels = instance.maximumOutputNumberOfChannels;
-        NSInteger prefChannels = MIN(maxChannels, ao->channels.num);
-        [instance setCategory:AVAudioSessionCategoryPlayback error:nil];
-        [instance setMode:AVAudioSessionModeMoviePlayback error:nil];
-        [instance setActive:YES error:nil];
-        [instance setPreferredOutputNumberOfChannels:prefChannels error:nil];
+    // The session is shared by the whole host, including concurrent players.
+    // Hosts with their own policy can opt out. Deactivation belongs to the
+    // host's lifecycle, never an individual AO reload or player teardown.
+    if (p->opt_manage_session) {
+        AVAudioSession *session = AVAudioSession.sharedInstance;
+        NSError *error = nil;
+        if (![session setCategory:AVAudioSessionCategoryPlayback
+                            mode:AVAudioSessionModeMoviePlayback options:0 error:&error] ||
+            ![session setSupportsMultichannelContent:YES error:&error] ||
+            ![session setActive:YES error:&error]) {
+            MP_ERR(ao, "audio session setup failed: %s\n", error.localizedDescription.UTF8String);
+            return CONTROL_ERROR;
+        }
+        // Physical headphone channels are not the decoded content layout.
+        // Keep ao->channels intact so Apple can spatialize surround content.
+        NSInteger preferred = MIN(session.maximumOutputNumberOfChannels, ao->channels.num);
+        if (!spdif && preferred > 0 &&
+            ![session setPreferredOutputNumberOfChannels:preferred error:&error])
+            MP_VERBOSE(ao, "preferred route channels unavailable: %s\n", error.localizedDescription.UTF8String);
     }
 #endif
 
@@ -1298,6 +1365,9 @@ static int init(struct ao *ao)
         MP_VERBOSE(ao, "AVSampleBufferAudioRenderer failed to initialize\n");
         goto error;
     }
+    if (@available(tvOS 15.0, iOS 15.0, macOS 12.0, *))
+        p->renderer.allowedAudioSpatializationFormats = spatial_formats(p);
+
     if ((p->synchronizer = [[AVSampleBufferRenderSynchronizer alloc] init]) == nil) {
         MP_FATAL(ao, "failed to create rendering synchronizer\n");
         MP_VERBOSE(ao, "AVSampleBufferRenderSynchronizer failed to initialize\n");
@@ -1414,14 +1484,6 @@ error:
     if (p->queue) dispatch_release(p->queue);
     if (p->format_description) CFRelease(p->format_description);
 
-#if TARGET_OS_IPHONE
-    if (!p->spdif) {
-        [AVAudioSession.sharedInstance setActive:NO
-            withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
-            error:nil
-        ];
-    }
-#endif
 
     return CONTROL_ERROR;
 }
@@ -1430,6 +1492,10 @@ static void uninit(struct ao *ao)
 {
     struct priv *p = ao->priv;
 
+    if (p->observer) {
+        [p->observer invalidate];
+        [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
+    }
     stop(ao);
 
     if (p->spdif) {
@@ -1460,18 +1526,9 @@ static void uninit(struct ao *ao)
         dispatch_release(p->queue);
         CFRelease(p->format_description);
 
-        [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
         [p->observer release];
     }
 
-#if TARGET_OS_IPHONE
-    if (!p->spdif) {
-        [AVAudioSession.sharedInstance setActive:NO
-            withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
-            error:nil
-        ];
-    }
-#endif
 }
 
 #define OPT_BASE_STRUCT struct priv
@@ -1489,6 +1546,8 @@ const struct ao_driver audio_out_avfoundation = {
     .priv_size      = sizeof(struct priv),
     .priv_defaults  = &(const struct priv){
         .opt_accept_compressed = true,
+        .opt_spatial_audio = 2,
+        .opt_manage_session = true,
         .opt_compressed_lead = 8,
         // Preserve PCM latency unless bound enabled.
 #if TARGET_OS_OSX
@@ -1499,6 +1558,9 @@ const struct ao_driver audio_out_avfoundation = {
 #if TARGET_OS_OSX
         {"max-lookahead", OPT_DOUBLE(opt_max_lookahead), M_RANGE(0, 10)},
 #endif
+        {"spatial-audio", OPT_CHOICE(opt_spatial_audio,
+            {"no", 0}, {"multichannel", 1}, {"all", 2})},
+        {"manage-audio-session", OPT_BOOL(opt_manage_session)},
         {"accept-compressed", OPT_BOOL(opt_accept_compressed)},
         {"compressed-lead", OPT_DOUBLE(opt_compressed_lead), M_RANGE(1, 30)},
         {0}
