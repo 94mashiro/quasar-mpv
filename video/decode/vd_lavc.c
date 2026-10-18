@@ -22,6 +22,8 @@
 #include <stdbool.h>
 
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
+#include <libavutil/dovi_meta.h>
 #include <libavformat/version.h>
 #include <libavutil/common.h>
 #include <libavutil/hwcontext.h>
@@ -84,6 +86,7 @@ struct vd_lavc_params {
     bool old_x264;
     bool apply_cropping;
     bool check_hw_profile;
+    bool dovi_el;
     char **avopts;
     int dr;
 };
@@ -113,6 +116,7 @@ const struct m_sub_options vd_lavc_conf = {
         {"vd-lavc-bitexact", OPT_BOOL(bitexact)},
         {"vd-lavc-assume-old-x264", OPT_BOOL(old_x264)},
         {"vd-lavc-check-hw-profile", OPT_BOOL(check_hw_profile)},
+        {"vd-lavc-dovi-el", OPT_BOOL(dovi_el)},
         {"vd-lavc-o", OPT_KEYVALUELIST(avopts)},
         {"vd-lavc-dr", OPT_CHOICE(dr,
             {"auto", -1}, {"no", 0}, {"yes", 1})},
@@ -243,6 +247,17 @@ typedef struct lavc_ctx {
     struct mp_image_pool *hwdec_swpool;
 
     AVBufferRef *cached_hw_frames_ctx;
+
+    // Dolby Vision Profile 7 enhancement layer (--vd-lavc-dovi-el): decoded
+    // from a dovi_split=mode=el copy of every packet, paired by pts.
+    AVBSFContext *el_bsf;
+    AVCodecContext *el_avctx;
+    AVPacket *el_pkt;
+    AVFrame *el_pic;
+    struct mp_image **el_queue;
+    int num_el_queue;
+    bool el_checked;
+    int el_misses;
 
     // --- The following fields are protected by dr_lock.
     mp_mutex dr_lock;
@@ -703,6 +718,189 @@ static void reinit(struct mp_filter *vd)
     }
 }
 
+enum { EL_QUEUE_MAX = 8 };
+
+static void flush_el(vd_ffmpeg_ctx *ctx)
+{
+    for (int n = 0; n < ctx->num_el_queue; n++)
+        talloc_free(ctx->el_queue[n]);
+    ctx->num_el_queue = 0;
+    if (ctx->el_bsf)
+        av_bsf_flush(ctx->el_bsf);
+    if (ctx->el_avctx)
+        avcodec_flush_buffers(ctx->el_avctx);
+}
+
+static void uninit_el(vd_ffmpeg_ctx *ctx)
+{
+    if (ctx->el_misses)
+        mp_verbose(ctx->log, "Dolby Vision enhancement layer missing on %d frames.\n",
+                   ctx->el_misses);
+    ctx->el_misses = 0;
+    flush_el(ctx);
+    av_bsf_free(&ctx->el_bsf);
+    avcodec_free_context(&ctx->el_avctx);
+    av_packet_free(&ctx->el_pkt);
+    av_frame_free(&ctx->el_pic);
+    ctx->el_checked = false;
+}
+
+static enum AVPixelFormat get_format_el(struct AVCodecContext *avctx,
+                                        const enum AVPixelFormat *fmt)
+{
+    vd_ffmpeg_ctx *ctx = ((struct mp_filter *)avctx->opaque)->priv;
+    for (int i = 0; fmt[i] != AV_PIX_FMT_NONE; i++) {
+        if (fmt[i] == ctx->hwdec.pix_fmt)
+            return fmt[i];
+    }
+    return avcodec_default_get_format(avctx, fmt);
+}
+
+// Profile 7 interleaves the enhancement layer (NAL type 63) with the base
+// layer in the same packets. Decode it with a second decoder on the same
+// hwdec device, as plain HEVC.
+static void init_el(struct mp_filter *vd)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+    struct mp_codec_params *c = ctx->codec;
+    const AVPacketSideData *sd = c->lav_codecpar ? av_packet_side_data_get(
+        c->lav_codecpar->coded_side_data, c->lav_codecpar->nb_coded_side_data,
+        AV_PKT_DATA_DOVI_CONF) : NULL;
+    const AVDOVIDecoderConfigurationRecord *cfg = sd ? (void *)sd->data : NULL;
+    if (!ctx->opts->dovi_el || !cfg || cfg->dv_profile != 7 || !cfg->el_present_flag ||
+        c->lav_codecpar->codec_id != AV_CODEC_ID_HEVC)
+        return;
+
+    const AVBitStreamFilter *split = av_bsf_get_by_name("dovi_split");
+    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    if (!split || !codec || av_bsf_alloc(split, &ctx->el_bsf) < 0 ||
+        av_opt_set(ctx->el_bsf->priv_data, "mode", "el", 0) < 0 ||
+        avcodec_parameters_copy(ctx->el_bsf->par_in, c->lav_codecpar) < 0)
+        goto fail;
+    ctx->el_bsf->time_base_in = ctx->codec_timebase;
+    if (av_bsf_init(ctx->el_bsf) < 0)
+        goto fail;
+    AVCodecParameters *par = ctx->el_bsf->par_out;
+    // Without the Dolby Vision record the EL gets a plain hvc1 session.
+    av_packet_side_data_remove(par->coded_side_data, &par->nb_coded_side_data,
+                               AV_PKT_DATA_DOVI_CONF);
+    ctx->el_avctx = avcodec_alloc_context3(codec);
+    if (!ctx->el_avctx || avcodec_parameters_to_context(ctx->el_avctx, par) < 0)
+        goto fail;
+    ctx->el_avctx->pkt_timebase = ctx->codec_timebase;
+    ctx->el_avctx->opaque = vd;
+    if (ctx->use_hwdec && ctx->avctx->hw_device_ctx &&
+        ctx->hwdec.pix_fmt != AV_PIX_FMT_NONE) {
+        ctx->el_avctx->hw_device_ctx = av_buffer_ref(ctx->avctx->hw_device_ctx);
+        ctx->el_avctx->get_format = get_format_el;
+        ctx->el_avctx->hwaccel_flags |= AV_HWACCEL_FLAG_IGNORE_LEVEL;
+    }
+    ctx->el_pkt = av_packet_alloc();
+    ctx->el_pic = av_frame_alloc();
+    if (!ctx->el_pkt || !ctx->el_pic || avcodec_open2(ctx->el_avctx, codec, NULL) < 0)
+        goto fail;
+    MP_VERBOSE(vd, "Dolby Vision Profile 7: decoding the enhancement layer (%dx%d)\n",
+               par->width, par->height);
+    return;
+
+fail:
+    MP_WARN(vd, "Could not open the Dolby Vision enhancement layer decoder.\n");
+    uninit_el(ctx);
+}
+
+static void receive_el(struct mp_filter *vd)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+    while (avcodec_receive_frame(ctx->el_avctx, ctx->el_pic) >= 0) {
+        struct mp_image *el = mp_image_from_av_frame(ctx->el_pic);
+        if (el) {
+            el->pts = mp_pts_from_av(ctx->el_pic->pts, &ctx->codec_timebase);
+            if (ctx->num_el_queue == EL_QUEUE_MAX) {
+                talloc_free(ctx->el_queue[0]);
+                MP_TARRAY_REMOVE_AT(ctx->el_queue, ctx->num_el_queue, 0);
+            }
+            MP_TARRAY_APPEND(ctx, ctx->el_queue, ctx->num_el_queue, el);
+        }
+        av_frame_unref(ctx->el_pic);
+    }
+}
+
+// pkt == NULL drains the EL decoder at the end of the stream.
+static void send_el(struct mp_filter *vd, const AVPacket *pkt)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+    if (!pkt) {
+        avcodec_send_packet(ctx->el_avctx, NULL);
+        receive_el(vd);
+        return;
+    }
+    if (av_packet_ref(ctx->el_pkt, pkt) < 0)
+        return;
+    if (av_bsf_send_packet(ctx->el_bsf, ctx->el_pkt) < 0) {
+        av_packet_unref(ctx->el_pkt);
+        return;
+    }
+    while (av_bsf_receive_packet(ctx->el_bsf, ctx->el_pkt) >= 0) {
+        receive_el(vd);
+        if (ctx->el_pkt->size && avcodec_send_packet(ctx->el_avctx, ctx->el_pkt) == AVERROR(EAGAIN)) {
+            receive_el(vd);
+            avcodec_send_packet(ctx->el_avctx, ctx->el_pkt);
+        }
+        av_packet_unref(ctx->el_pkt);
+    }
+    receive_el(vd);
+}
+
+// The first RPU tells FEL from MEL. MEL's residual is zero, so stop
+// decoding its EL.
+static bool el_is_trivial(struct mp_image *mpi)
+{
+    for (int i = 0; i < mpi->num_ff_side_data; i++) {
+        if (mpi->ff_side_data[i].type != AV_FRAME_DATA_DOVI_METADATA)
+            continue;
+        const AVDOVIMetadata *m = (void *)mpi->ff_side_data[i].buf->data;
+        const AVDOVIRpuDataHeader *h = av_dovi_get_header(m);
+        const AVDOVIDataMapping *map = av_dovi_get_mapping(m);
+        if (h->disable_residual_flag)
+            return true;
+        for (int c = 0; c < 3; c++) {
+            if (map->nlq[c].linear_deadzone_slope || map->nlq[c].linear_deadzone_threshold)
+                return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+static void attach_el(struct mp_filter *vd, struct mp_image *mpi)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+    if (!ctx->el_checked) {
+        ctx->el_checked = true;
+        if (el_is_trivial(mpi)) {
+            MP_VERBOSE(vd, "Dolby Vision Profile 7 MEL: not decoding the enhancement layer.\n");
+            uninit_el(ctx);
+            return;
+        }
+    }
+    receive_el(vd);
+    while (ctx->num_el_queue && mpi->pts != MP_NOPTS_VALUE) {
+        struct mp_image *el = ctx->el_queue[0];
+        if (el->pts > mpi->pts + 1e-6)
+            break;
+        MP_TARRAY_REMOVE_AT(ctx->el_queue, ctx->num_el_queue, 0);
+        if (el->pts >= mpi->pts - 1e-6) {
+            mpi->enhancement_layer = el;
+            break;
+        }
+        talloc_free(el);
+    }
+    // ponytail: no wait for a late EL; the frame shows as base layer only.
+    // Pair at delay_queue output if these warnings show up in practice.
+    if (!mpi->enhancement_layer && ctx->el_avctx && ctx->el_misses++ == 0)
+        MP_WARN(vd, "Dolby Vision enhancement layer missing; showing the base layer.\n");
+}
+
 static void init_avctx(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
@@ -871,6 +1069,7 @@ static void init_avctx(struct mp_filter *vd)
         avcodec_flush_buffers(ctx->avctx);
     }
 
+    init_el(vd);
     return;
 
 error:
@@ -884,6 +1083,7 @@ static void reset_avctx(struct mp_filter *vd)
 
     if (ctx->avctx && avcodec_is_open(ctx->avctx))
         avcodec_flush_buffers(ctx->avctx);
+    flush_el(ctx);
     ctx->flushing = false;
     ctx->hwdec_request_reinit = false;
     mp_hwdec_recovery_reset(&ctx->hwdec_recovery);
@@ -917,6 +1117,7 @@ static void uninit_avctx(struct mp_filter *vd)
     mp_free_av_packet(&ctx->avpkt);
     av_buffer_unref(&ctx->cached_hw_frames_ctx);
 
+    uninit_el(ctx);
     avcodec_free_context(&ctx->avctx);
     mp_av_log_unregister_decoder(vd);
 
@@ -1205,6 +1406,8 @@ static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
     int ret = avcodec_send_packet(avctx, pkt ? ctx->avpkt : NULL);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
         return ret;
+    if (ctx->el_avctx)
+        send_el(vd, pkt ? ctx->avpkt : NULL);
 
     // Count keyframe only after packet consumed/rejected. EAGAIN/EOF retries
     // spend no allowance.
@@ -1299,6 +1502,9 @@ static int decode_frame(struct mp_filter *vd)
     mpi->pkt_duration = mp_pts_from_av(ctx->pic->duration, &ctx->codec_timebase);
 
     av_frame_unref(ctx->pic);
+
+    if (ctx->el_avctx)
+        attach_el(vd, mpi);
 
     MP_TARRAY_APPEND(ctx, ctx->delay_queue, ctx->num_delay_queue, mpi);
     return ret;

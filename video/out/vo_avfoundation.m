@@ -37,6 +37,8 @@
 #include "avfoundation_color.h"
 #include "avfoundation_hdr10plus.h"
 #include "avfoundation_vivid.h"
+#include "avfoundation_fel.h"
+#include <libavutil/dovi_meta.h>
 #include <libavutil/hdr_dynamic_vivid_metadata.h>
 
 #import <CoreMedia/CoreMedia.h>
@@ -432,6 +434,17 @@ struct priv {
     bool vivid_lut_full;
     struct avf_vivid_uniforms vivid_uniforms;
     int vivid_state;
+
+    // Dolby Vision Profile 7 FEL composition (avfoundation_fel.h).
+    id<MTLDevice> felDevice;
+    id<MTLCommandQueue> felQueue;
+    id<MTLComputePipelineState> felPipeline;
+    CVMetalTextureCacheRef felTextureCache;
+    CVPixelBufferPoolRef felPool, felReservePool, felElPool;
+    int fel_pool_w, fel_pool_h, fel_el_pool_w, fel_el_pool_h;
+    OSType fel_pool_format, fel_el_pool_format;
+    bool fel_setup_failed;
+    int fel_state;
 
     // Log resized-composite rejection once.
     bool composite_size_mismatch_logged;
@@ -3944,6 +3957,228 @@ static CVPixelBufferRef map_vivid_frame(struct vo *vo, mp_image_t *mpi, CVPixelB
     return out;
 }
 
+enum {
+    AVF_FEL_NONE = 0,
+    AVF_FEL_COMPOSED,
+    AVF_FEL_MEL,
+    AVF_FEL_UNSUPPORTED,
+    AVF_FEL_FAILED,
+};
+
+static void release_fel(struct priv *p)
+{
+    [p->felPipeline release];
+    p->felPipeline = nil;
+    [p->felQueue release];
+    p->felQueue = nil;
+    if (p->felTextureCache) {
+        CFRelease(p->felTextureCache);
+        p->felTextureCache = NULL;
+    }
+    CVPixelBufferPoolRef *pools[] = {&p->felPool, &p->felReservePool, &p->felElPool};
+    for (int i = 0; i < 3; i++) {
+        if (*pools[i]) {
+            CVPixelBufferPoolRelease(*pools[i]);
+            *pools[i] = NULL;
+        }
+    }
+    [p->felDevice release];
+    p->felDevice = nil;
+}
+
+static bool ensure_fel(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+
+    if (p->felPipeline)
+        return true;
+    if (p->fel_setup_failed)
+        return false;
+    p->fel_setup_failed = true;
+    p->felDevice = MTLCreateSystemDefaultDevice();
+    if (!p->felDevice)
+        return false;
+    NSError *err = nil;
+    id<MTLLibrary> lib = [p->felDevice newLibraryWithSource:@(avf_fel_metal_source)
+                                                    options:nil error:&err];
+    id<MTLFunction> fn = [lib newFunctionWithName:@"fel_compose"];
+    if (fn)
+        p->felPipeline = [p->felDevice newComputePipelineStateWithFunction:fn error:&err];
+    [fn release];
+    [lib release];
+    if (!p->felPipeline) {
+        MP_ERR(vo, "Dolby Vision FEL kernel failed: %s\n", err.localizedDescription.UTF8String);
+        release_fel(p);
+        return false;
+    }
+    p->felQueue = [p->felDevice newCommandQueue];
+    if (!p->felQueue || CVMetalTextureCacheCreate(NULL, NULL, p->felDevice, NULL,
+                                                  &p->felTextureCache) != kCVReturnSuccess) {
+        release_fel(p);
+        return false;
+    }
+    p->fel_setup_failed = false;
+    return true;
+}
+
+static bool fel_params_from_av(const AVDOVIMetadata *m, struct avf_fel_params *out)
+{
+    const AVDOVIRpuDataHeader *h = av_dovi_get_header(m);
+    const AVDOVIDataMapping *map = av_dovi_get_mapping(m);
+    if (map->nlq_method_idc != AV_DOVI_NLQ_LINEAR_DZ)
+        return false;
+    *out = (struct avf_fel_params){
+        .bl_bits = h->bl_bit_depth, .el_bits = h->el_bit_depth,
+        .denom = h->coef_log2_denom, .disable_residual = h->disable_residual_flag,
+    };
+    for (int c = 0; c < 3; c++) {
+        const AVDOVIReshapingCurve *k = &map->curves[c];
+        struct avf_fel_comp *o = &out->comp[c];
+        o->num_pivots = k->num_pivots;
+        memcpy(o->pivots, k->pivots, sizeof(o->pivots));
+        for (int i = 0; i < 8; i++) {
+            o->mapping_idc[i] = k->mapping_idc[i];
+            o->poly_order[i] = k->poly_order[i];
+            o->mmr_order[i] = k->mmr_order[i];
+            o->mmr_constant[i] = k->mmr_constant[i];
+        }
+        memcpy(o->poly_coef, k->poly_coef, sizeof(o->poly_coef));
+        memcpy(o->mmr_coef, k->mmr_coef, sizeof(o->mmr_coef));
+        o->nlq_offset = map->nlq[c].nlq_offset;
+        o->vdr_in_max = map->nlq[c].vdr_in_max;
+        o->slope = map->nlq[c].linear_deadzone_slope;
+        o->threshold = map->nlq[c].linear_deadzone_threshold;
+    }
+    return true;
+}
+
+static bool fel_texture(struct priv *p, CVPixelBufferRef buf, int plane, CVMetalTextureRef *out)
+{
+    return CVMetalTextureCacheCreateTextureFromImage(NULL, p->felTextureCache, buf, NULL,
+        plane ? MTLPixelFormatRG16Unorm : MTLPixelFormatR16Unorm,
+        CVPixelBufferGetWidthOfPlane(buf, plane), CVPixelBufferGetHeightOfPlane(buf, plane),
+        plane, out) == kCVReturnSuccess;
+}
+
+// The EL as a P010 buffer: the VideoToolbox frame itself, or a software
+// frame uploaded into its own pool (BL and EL sizes differ).
+static CVPixelBufferRef fel_el_buffer(struct vo *vo, struct mp_image *el)
+{
+    struct priv *p = vo->priv;
+
+    if (el->imgfmt == IMGFMT_VIDEOTOOLBOX) {
+        CVPixelBufferRef buf = (CVPixelBufferRef)el->planes[3];
+        return buf ? CVPixelBufferRetain(buf) : NULL;
+    }
+    CVPixelBufferRef buf = NULL;
+    if (el->imgfmt != imgfmt_420p10() ||
+        !create_pixel_buffer_pool(vo, &p->felElPool, &p->fel_el_pool_w, &p->fel_el_pool_h,
+                                  &p->fel_el_pool_format, el->w, el->h,
+                                  kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, "FEL EL upload") ||
+        avf_pool_get_buffer(p->felElPool, &buf) != kCVReturnSuccess)
+        return NULL;
+    if (CVPixelBufferLockBaseAddress(buf, 0) != kCVReturnSuccess) {
+        CVPixelBufferRelease(buf);
+        return NULL;
+    }
+    upload_420p1x_to_p010(el, buf, 6);
+    CVPixelBufferUnlockBaseAddress(buf, 0);
+    return buf;
+}
+
+static int run_fel(struct vo *vo, mp_image_t *mpi, CVPixelBufferRef bl, CVPixelBufferRef *out)
+{
+    struct priv *p = vo->priv;
+
+    const AVDOVIMetadata *meta = NULL;
+    for (int i = 0; i < mpi->num_ff_side_data; i++) {
+        if (mpi->ff_side_data[i].type == AV_FRAME_DATA_DOVI_METADATA)
+            meta = (const AVDOVIMetadata *)mpi->ff_side_data[i].buf->data;
+    }
+    struct avf_fel_params params;
+    if (!meta || !fel_params_from_av(meta, &params))
+        return AVF_FEL_UNSUPPORTED;
+    if (!avf_fel_has_residual(&params))
+        return AVF_FEL_MEL;
+    struct mp_image *el = mpi->enhancement_layer;
+    int w = (int)CVPixelBufferGetWidth(bl), h = (int)CVPixelBufferGetHeight(bl);
+    bool half = el->w * 2 == w && el->h * 2 == h;
+    struct avf_fel_uniforms u;
+    if (!is_p010_format(CVPixelBufferGetPixelFormatType(bl)) || is_full_range_yuv_format(
+            CVPixelBufferGetPixelFormatType(bl)) || (!half && (el->w != w || el->h != h)) ||
+        !avf_fel_prepare(&params, half, &u))
+        return AVF_FEL_UNSUPPORTED;
+    if (!ensure_fel(vo))
+        return AVF_FEL_FAILED;
+
+    CVPixelBufferRef elbuf = fel_el_buffer(vo, el), dst = NULL;
+    if (!elbuf || !is_p010_format(CVPixelBufferGetPixelFormatType(elbuf)) ||
+        !create_pixel_buffer_pool(vo, &p->felPool, &p->fel_pool_w, &p->fel_pool_h,
+                                  &p->fel_pool_format, w, h,
+                                  CVPixelBufferGetPixelFormatType(bl), "FEL output") ||
+        avf_pool_get_buffer_for_frame(vo, p->felPool, &p->felReservePool, &dst) != kCVReturnSuccess) {
+        CVPixelBufferRelease(elbuf);
+        return AVF_FEL_FAILED;
+    }
+
+    CVMetalTextureRef tex[6] = {0};
+    CVPixelBufferRef bufs[3] = {bl, elbuf, dst};
+    bool ok = true;
+    for (int i = 0; i < 6 && ok; i++)
+        ok = fel_texture(p, bufs[i / 2], i % 2, &tex[i]);
+    if (ok) {
+        // ponytail: waits for the GPU on the VO thread like the Vivid kernel;
+        // pipeline frames if 4K60 misses its deadline.
+        id<MTLCommandBuffer> cmd = [p->felQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p->felPipeline];
+        for (int i = 0; i < 6; i++)
+            [enc setTexture:CVMetalTextureGetTexture(tex[i]) atIndex:i];
+        [enc setBytes:&u length:sizeof(u) atIndex:0];
+        NSUInteger tw = p->felPipeline.threadExecutionWidth;
+        NSUInteger th = MPMAX(p->felPipeline.maxTotalThreadsPerThreadgroup / tw, 1);
+        [enc dispatchThreads:MTLSizeMake(CVPixelBufferGetWidthOfPlane(bl, 1),
+                                         CVPixelBufferGetHeightOfPlane(bl, 1), 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        ok = cmd.status == MTLCommandBufferStatusCompleted;
+    }
+    for (int i = 0; i < 6; i++) {
+        if (tex[i])
+            CFRelease(tex[i]);
+    }
+    CVPixelBufferRelease(elbuf);
+    if (!ok) {
+        CVPixelBufferRelease(dst);
+        return AVF_FEL_FAILED;
+    }
+    // The BL's attachments describe the composed frame too: the decoder's
+    // Profile 7 conversion left a P8.1 RPU with identity reshaping, which is
+    // what a composed frame needs (a no-op RPU). Pooled buffers
+    // keep the last frame's attachments.
+    CVBufferRemoveAllAttachments(dst);
+    CVBufferPropagateAttachments(bl, dst);
+    *out = dst;
+    return AVF_FEL_COMPOSED;
+}
+
+// Returns an owned composed frame, or NULL to keep the base layer.
+static CVPixelBufferRef compose_fel_frame(struct vo *vo, mp_image_t *mpi, CVPixelBufferRef bl)
+{
+    struct priv *p = vo->priv;
+
+    CVPixelBufferRef out = NULL;
+    int state = mpi->enhancement_layer ? run_fel(vo, mpi, bl, &out) : AVF_FEL_NONE;
+    if (state != p->fel_state && (state != AVF_FEL_NONE || p->fel_state == AVF_FEL_COMPOSED)) {
+        const char *states[] = {"no-enhancement-layer", "composed", "mel", "unsupported", "failed"};
+        MP_INFO(vo, "MPVUI_NATIVE_DOLBY_VISION_FEL: %s\n", states[state]);
+    }
+    p->fel_state = state;
+    return out;
+}
+
 static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *mpi)
 {
     @autoreleasepool {
@@ -3971,7 +4206,16 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
             p->video_statistics.pixel_buffer_copies++;
         }
 
-        // HDR Vivid: map before subtitles and geometry draw on the frame.
+        // Profile 7 FEL, then HDR Vivid: both before subtitles and geometry
+        // draw on the frame.
+        CVPixelBufferRef fel = compose_fel_frame(vo, mpi, pixbuf);
+        if (fel) {
+            if (pixbufNeedsRelease)
+                CVPixelBufferRelease(pixbuf);
+            pixbuf = fel;
+            pixbufNeedsRelease = true;
+            p->video_statistics.pixel_buffer_copies++;
+        }
         CVPixelBufferRef vivid = map_vivid_frame(vo, mpi, pixbuf);
         if (vivid) {
             if (pixbufNeedsRelease)
@@ -4439,7 +4683,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
     MP_VERBOSE(vo, "reconfig: %dx%d\n", params->w, params->h);
     struct priv *p = vo->priv;
-    p->dovi_validated_state = p->hdr10plus_state = p->vivid_state = 0;
+    p->dovi_validated_state = p->hdr10plus_state = p->vivid_state = p->fel_state = 0;
     p->video_statistics = (struct voctrl_native_video_statistics){0};
     p->dovi_unsupported_logged = false;
     clear_sw_upload_metadata(p);
@@ -4511,6 +4755,7 @@ static void uninit(struct vo *vo)
     p->video_format_attachments = NULL;
     release_ci_compositor(p);
     release_vivid(p);
+    release_fel(p);
 
     [p->displayLayer release];
     p->displayLayer = nil;
