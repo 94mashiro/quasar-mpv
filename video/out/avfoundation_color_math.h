@@ -91,8 +91,15 @@ static inline void avf_subtitle_nits(const struct avf_overlay_color *color,
     double a = bgra[3] / 255.0;
     double sub[3] = {0};
     if (a > 0) {
-        for (int c = 0; c < 3; c++)
-            sub[c] = avf_srgb_decode(avf_clamp(bgra[2 - c] / (255.0 * a), 0, 1));
+        // White/gray/black caption pixels share one decoded component. Avoid
+        // repeating the same sRGB transfer for all three channels every frame.
+        if (bgra[0] == bgra[1] && bgra[1] == bgra[2]) {
+            sub[0] = sub[1] = sub[2] =
+                avf_srgb_decode(avf_clamp(bgra[0] / (255.0 * a), 0, 1));
+        } else {
+            for (int c = 0; c < 3; c++)
+                sub[c] = avf_srgb_decode(avf_clamp(bgra[2 - c] / (255.0 * a), 0, 1));
+        }
     }
     double white = color->transfer == AVF_PQ || color->transfer == AVF_HLG ? color->white_nits : 100;
     for (int c = 0; c < 3; c++) {
@@ -110,15 +117,19 @@ static inline void avf_blend_pixel(const struct avf_overlay_color *color,
     double a = bgra[3] / 255.0;
     if (a == 0) return; // preserve even out-of-range original values exactly
     double kr = color->kr, kb = color->kb, kg = 1 - kr - kb;
-    double rgb[3] = {
-        yuv[0] + 2 * (1 - kr) * yuv[2],
-        yuv[0] - 2 * kb * (1 - kb) / kg * yuv[1] - 2 * kr * (1 - kr) / kg * yuv[2],
-        yuv[0] + 2 * (1 - kb) * yuv[1]
-    };
-    avf_to_nits(color->transfer, rgb, kr, kb);
-    double sub[3];
-    avf_subtitle_nits(color, bgra, sub);
-    for (int c = 0; c < 3; c++) rgb[c] = rgb[c] * (1 - a) + sub[c] * a;
+    double rgb[3];
+    avf_subtitle_nits(color, bgra, rgb);
+    // Fully opaque artwork replaces the background, so decoding it would be
+    // discarded work (including the expensive PQ/HLG transfer functions).
+    if (bgra[3] != 255) {
+        double background[3] = {
+            yuv[0] + 2 * (1 - kr) * yuv[2],
+            yuv[0] - 2 * kb * (1 - kb) / kg * yuv[1] - 2 * kr * (1 - kr) / kg * yuv[2],
+            yuv[0] + 2 * (1 - kb) * yuv[1]
+        };
+        avf_to_nits(color->transfer, background, kr, kb);
+        for (int c = 0; c < 3; c++) rgb[c] = background[c] * (1 - a) + rgb[c] * a;
+    }
     avf_from_nits(color->transfer, rgb, kr, kb);
     yuv[0] = kr * rgb[0] + kg * rgb[1] + kb * rgb[2];
     yuv[1] = (rgb[2] - yuv[0]) / (2 * (1 - kb));

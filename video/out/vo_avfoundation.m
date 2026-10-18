@@ -326,17 +326,26 @@ struct priv {
     __strong id<MTLDevice> mtlDevice;
     __strong CIContext *ciContext;
     CVPixelBufferPoolRef outputPool;
+    CVPixelBufferPoolRef outputReservePool;
     int output_pool_w, output_pool_h;
     OSType output_pool_format;
     CVPixelBufferRef cachedSubtitleBuffer;
     struct avf_subtitle_image_cache subtitleImageCache;
+    bool overlay_matrix_valid;
+    enum pl_color_primaries overlay_matrix_primaries;
+    double overlay_rgb_matrix[3][3];
     int subtitle_x0, subtitle_y0, subtitle_x1, subtitle_y1;
     bool has_subtitle;
 
     // Software upload.
     CVPixelBufferPoolRef swUploadPool;
+    CVPixelBufferPoolRef swUploadReservePool;
+    int64_t pool_frame_duration_ns;
     int sw_pool_w, sw_pool_h;
     OSType sw_pool_format;
+    CFDictionaryRef sw_upload_attachments;
+    struct mp_image_params sw_upload_params;
+    OSType sw_upload_metadata_format;
 
     // Cache format description; rebuild when dimensions, format, or
     // attachments change.
@@ -1201,13 +1210,126 @@ static AVBufferRef *create_videotoolbox_device_ref(struct vo *vo)
     return device_ref;
 }
 
-// Pool cap: eight buffers. Readiness/queue lead bound scheduling; drop frame
-// under pressure, never grow pool.
+// Presentation pool capacity follows the scheduled queue, with three buffers for
+// renderer retention/upload and a separate paused replacement reserve. A fixed
+// seven-buffer pool can exhaust before queued 120 fps samples are retired.
+// Keep allocation lazy and bounded even with extreme frame rates or queue leads.
+enum { AVF_POOL_MAX_BUFFERS = 32 };
+
+static int avf_presentation_pool_limit(int queue_lead_ms, int64_t frame_duration_ns,
+                                      bool presentation_host)
+{
+    int regular = 7;
+    if (frame_duration_ns > 0) {
+        int64_t lead = MP_TIME_MS_TO_NS(queue_lead_ms);
+        int64_t queued = lead / frame_duration_ns + (lead % frame_duration_ns != 0);
+        regular = MPMAX(regular, MPMIN(queued + 3, AVF_POOL_MAX_BUFFERS - 1));
+    }
+    return regular + (presentation_host ? 1 : 0);
+}
+
+// AVFoundation can retain queued buffers after flush until a new image arrives.
+static CVReturn avf_pool_get_buffer_with_limit(CVPixelBufferPoolRef pool,
+                                               int limit, CVPixelBufferRef *out)
+{
+    if (limit < 1 || limit > AVF_POOL_MAX_BUFFERS)
+        return kCVReturnInvalidArgument;
+    static NSDictionary *attributes[AVF_POOL_MAX_BUFFERS];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        for (int i = 0; i < AVF_POOL_MAX_BUFFERS; i++)
+            attributes[i] = [@{(id)kCVPixelBufferPoolAllocationThresholdKey: @(i + 1)} retain];
+    });
+    return CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+        kCFAllocatorDefault, pool, (__bridge CFDictionaryRef)attributes[limit - 1], out);
+}
+
 static CVReturn avf_pool_get_buffer(CVPixelBufferPoolRef pool, CVPixelBufferRef *out)
 {
-    return CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
-        kCFAllocatorDefault, pool,
-        (CFDictionaryRef)@{(id)kCVPixelBufferPoolAllocationThresholdKey: @8}, out);
+    return avf_pool_get_buffer_with_limit(pool, 8, out);
+}
+
+static CVReturn avf_pool_get_reserve_buffer(CVPixelBufferPoolRef pool,
+                                            CVPixelBufferPoolRef *reserve_pool,
+                                            CVPixelBufferRef *out)
+{
+    CFDictionaryRef attributes = CVPixelBufferPoolGetPixelBufferAttributes(pool);
+    if (*reserve_pool && !CFEqual(attributes,
+            CVPixelBufferPoolGetPixelBufferAttributes(*reserve_pool))) {
+        CVPixelBufferPoolRelease(*reserve_pool);
+        *reserve_pool = NULL;
+    }
+    if (!*reserve_pool) {
+        NSDictionary *pool_attributes = @{
+            (id)kCVPixelBufferPoolMinimumBufferCountKey: @1,
+            (id)kCVPixelBufferPoolMaximumBufferAgeKey: @1.0,
+        };
+        CVReturn status = CVPixelBufferPoolCreate(kCFAllocatorDefault,
+            (__bridge CFDictionaryRef)pool_attributes, attributes, reserve_pool);
+        if (status != kCVReturnSuccess)
+            return status;
+    }
+    return avf_pool_get_buffer_with_limit(*reserve_pool, 1, out);
+}
+
+static CVReturn avf_pool_get_buffer_for_frame(struct vo *vo,
+                                             CVPixelBufferPoolRef pool,
+                                             CVPixelBufferPoolRef *reserve_pool,
+                                             CVPixelBufferRef *out)
+{
+    struct priv *p = vo->priv;
+    bool allow_reserve = p->playback_paused && !p->presentation_host;
+    int limit = avf_presentation_pool_limit(p->opts->queue_lead_ms,
+        p->pool_frame_duration_ns, p->presentation_host);
+    CVReturn status = avf_pool_get_buffer_with_limit(pool, limit, out);
+    if (status == kCVReturnWouldExceedAllocationThreshold && allow_reserve)
+        status = avf_pool_get_reserve_buffer(pool, reserve_pool, out);
+    if (status != kCVReturnWouldExceedAllocationThreshold)
+        return status;
+
+    int64_t start = mp_time_ns();
+    int64_t deadline = p->playback_paused && !p->presentation_host
+        ? start + MP_TIME_MS_TO_NS(20)
+        : p->next_present_host_ns > 0
+            ? p->next_present_host_ns - MP_TIME_MS_TO_NS(4)
+            : start + MP_TIME_MS_TO_NS(2);
+    // Bound teardown latency even when queue-lead-ms is set to a full second.
+    deadline = MPMIN(deadline, start + MP_TIME_MS_TO_NS(128));
+    if (deadline <= start)
+        return status;
+
+    // Presentation can retain every regular upload buffer briefly. Wait for a
+    // recycled buffer instead of growing the pool or discarding a timely frame.
+    // The copied observer block retains this semaphore under MRC; it captures no
+    // VO state and remains safe if notification delivery overlaps removal.
+    dispatch_semaphore_t available = dispatch_semaphore_create(0);
+    if (!available)
+        return status;
+    CVPixelBufferPoolRef reserve = allow_reserve ? *reserve_pool : NULL;
+    id observer = [[NSNotificationCenter defaultCenter]
+        addObserverForName:(__bridge NSString *)kCVPixelBufferPoolFreeBufferNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *notification) {
+                    if (notification.object == (__bridge id)pool ||
+                        (reserve && notification.object == (__bridge id)reserve))
+                        dispatch_semaphore_signal(available);
+                }];
+    // Close the race between the failed allocation and observer registration.
+    while (true) {
+        status = avf_pool_get_buffer_with_limit(pool, limit, out);
+        if (status == kCVReturnWouldExceedAllocationThreshold && allow_reserve)
+            status = avf_pool_get_buffer_with_limit(reserve, 1, out);
+        if (status != kCVReturnWouldExceedAllocationThreshold)
+            break;
+        int64_t remaining = deadline - mp_time_ns();
+        if (remaining <= 0 || dispatch_semaphore_wait(available,
+                dispatch_time(DISPATCH_TIME_NOW, remaining)) != 0)
+            break;
+    }
+    [[NSNotificationCenter defaultCenter] removeObserver:observer];
+    dispatch_release(available);
+    return status;
 }
 
 // Create pixel-buffer pool.
@@ -1386,8 +1508,12 @@ static bool copy_pixel_buffer_planes(CVPixelBufferRef src, CVPixelBufferRef dst)
                 ok = false;
                 break;
             }
-            for (size_t y = 0; y < height; y++)
-                memcpy(dst_base + y * dst_stride, src_base + y * src_stride, bytes);
+            if (src_stride == dst_stride) {
+                memcpy(dst_base, src_base, bytes * height);
+            } else {
+                for (size_t y = 0; y < height; y++)
+                    memcpy(dst_base + y * dst_stride, src_base + y * src_stride, bytes);
+            }
         }
     } else if (ok) {
         uint8_t *src_base = CVPixelBufferGetBaseAddress(src);
@@ -1398,8 +1524,12 @@ static bool copy_pixel_buffer_planes(CVPixelBufferRef src, CVPixelBufferRef dst)
         size_t bytes = MPMIN(src_stride, dst_stride);
         ok = src_base && dst_base;
         if (ok) {
-            for (size_t y = 0; y < height; y++)
-                memcpy(dst_base + y * dst_stride, src_base + y * src_stride, bytes);
+            if (src_stride == dst_stride) {
+                memcpy(dst_base, src_base, bytes * height);
+            } else {
+                for (size_t y = 0; y < height; y++)
+                    memcpy(dst_base + y * dst_stride, src_base + y * src_stride, bytes);
+            }
         }
     }
 
@@ -1464,6 +1594,41 @@ static bool create_sw_upload_pool(struct vo *vo, int w, int h, OSType format)
     struct priv *p = vo->priv;
     return create_pixel_buffer_pool(vo, &p->swUploadPool, &p->sw_pool_w,
         &p->sw_pool_h, &p->sw_pool_format, w, h, format, "software upload");
+}
+
+static void clear_sw_upload_metadata(struct priv *p)
+{
+    if (p->sw_upload_attachments)
+        CFRelease(p->sw_upload_attachments);
+    p->sw_upload_attachments = NULL;
+}
+
+static void tag_sw_upload_metadata(struct vo *vo, CVPixelBufferRef pixbuf,
+                                    const struct mp_image_params *params)
+{
+    struct priv *p = vo->priv;
+    struct mp_image_params stable = *params;
+    // Software Dolby Vision is rejected before upload. Never keep decoder-owned
+    // metadata pointers in a cache that can outlive the input image.
+    stable.repr.dovi = NULL;
+    stable.imgfmt_name = NULL;
+    OSType format = CVPixelBufferGetPixelFormatType(pixbuf);
+    if (p->sw_upload_attachments && p->sw_upload_metadata_format == format &&
+        mp_image_params_equal(&p->sw_upload_params, &stable)) {
+        CVBufferSetAttachments(pixbuf, p->sw_upload_attachments,
+                               kCVAttachmentMode_ShouldPropagate);
+        return;
+    }
+
+    tag_pixel_buffer_color_metadata(pixbuf, params);
+    CFDictionaryRef attachments = CVBufferGetAttachments(pixbuf, kCVAttachmentMode_ShouldPropagate);
+    // The composite can remove per-frame HDR tags from this buffer in place.
+    // Keep an immutable snapshot so the next upload restores the original tags.
+    CFDictionaryRef snapshot = attachments ? CFDictionaryCreateCopy(NULL, attachments) : NULL;
+    clear_sw_upload_metadata(p);
+    p->sw_upload_attachments = snapshot;
+    p->sw_upload_params = stable;
+    p->sw_upload_metadata_format = format;
 }
 
 static void reset_osd_buf_states(struct priv *p)
@@ -1688,7 +1853,8 @@ static CVPixelBufferRef upload_software_frame(struct vo *vo, struct mp_image *mp
         return NULL;
 
     CVPixelBufferRef pixbuf = NULL;
-    CVReturn status = avf_pool_get_buffer(p->swUploadPool, &pixbuf);
+    CVReturn status = avf_pool_get_buffer_for_frame(vo, p->swUploadPool,
+                                                  &p->swUploadReservePool, &pixbuf);
 
     if (status != kCVReturnSuccess || !pixbuf) {
         MP_ERR(vo, "Failed to get upload buffer: %d\n", status);
@@ -1756,7 +1922,7 @@ static CVPixelBufferRef upload_software_frame(struct vo *vo, struct mp_image *mp
     }
 
     CVPixelBufferUnlockBaseAddress(pixbuf, 0);
-    tag_pixel_buffer_color_metadata(pixbuf, &mpi->params);
+    tag_sw_upload_metadata(vo, pixbuf, &mpi->params);
 
     return pixbuf;
 }
@@ -2379,31 +2545,44 @@ static bool render_osd_with_geometry(struct vo *vo, double pts,
     }
     void *base = CVPixelBufferGetBaseAddress(buf);
     size_t stride = CVPixelBufferGetBytesPerRow(buf);
-    CGColorSpaceRef color = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGContextRef cg = base && color ? CGBitmapContextCreate(
-        base, p->osd_w, p->osd_h, 8, stride, color,
-        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little) : NULL;
-    if (color)
-        CGColorSpaceRelease(color);
-    if (!cg) {
+    if (!base || !stride) {
         CVPixelBufferUnlockBaseAddress(buf, 0);
         CVPixelBufferRelease(buf);
         talloc_free(list);
         return false;
     }
+    CGContextRef cg = NULL;
     struct mp_rect bounds = {p->osd_w, p->osd_h, 0, 0};
     int64_t start = mp_time_ns();
     for (int i = 0; i < list->num_items; i++) {
         struct sub_bitmaps *group = list->items[i];
-        if (!draw_subtitle_bitmaps_direct(p, base, stride, p->osd_w, p->osd_h, group))
+        if (!draw_subtitle_bitmaps_direct(p, base, stride, p->osd_w, p->osd_h, group)) {
+            if (!cg) {
+                CGColorSpaceRef color = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+                cg = color ? CGBitmapContextCreate(
+                    base, p->osd_w, p->osd_h, 8, stride, color,
+                    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little) : NULL;
+                if (color)
+                    CGColorSpaceRelease(color);
+                if (!cg) {
+                    // Earlier direct groups may already have written pixels.
+                    osd_buf_record_dirty(p, buf, (struct mp_rect){0, 0, p->osd_w, p->osd_h});
+                    CVPixelBufferUnlockBaseAddress(buf, 0);
+                    CVPixelBufferRelease(buf);
+                    talloc_free(list);
+                    return false;
+                }
+            }
             draw_subtitle_bitmaps(cg, group, p->osd_h);
+        }
         update_subtitle_bounds_from_parts(p, group);
         bounds.x0 = MPMIN(bounds.x0, p->subtitle_x0);
         bounds.y0 = MPMIN(bounds.y0, p->subtitle_y0);
         bounds.x1 = MPMAX(bounds.x1, p->subtitle_x1);
         bounds.y1 = MPMAX(bounds.y1, p->subtitle_y1);
     }
-    CGContextRelease(cg);
+    if (cg)
+        CGContextRelease(cg);
     CVPixelBufferUnlockBaseAddress(buf, 0);
     p->cachedSubtitleBuffer = buf;
     p->subtitle_x0 = bounds.x0;
@@ -2496,11 +2675,16 @@ static struct avf_overlay_color get_overlay_color(struct vo *vo, CVPixelBufferRe
     for (int i = 0; cvprim && i < MP_ARRAY_SIZE(candidates); i++)
         if (CFEqual(cvprim, get_cv_color_primaries(candidates[i]))) prim = candidates[i];
     if (prim == PL_COLOR_PRIM_UNKNOWN) prim = PL_COLOR_PRIM_BT_709;
-    pl_matrix3x3 matrix = pl_get_color_mapping_matrix(
-        pl_raw_primaries_get(PL_COLOR_PRIM_BT_709), pl_raw_primaries_get(prim),
-        PL_INTENT_RELATIVE_COLORIMETRIC);
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 3; j++) color.rgb_matrix[i][j] = matrix.m[i][j];
+    if (!p->overlay_matrix_valid || p->overlay_matrix_primaries != prim) {
+        pl_matrix3x3 matrix = pl_get_color_mapping_matrix(
+            pl_raw_primaries_get(PL_COLOR_PRIM_BT_709), pl_raw_primaries_get(prim),
+            PL_INTENT_RELATIVE_COLORIMETRIC);
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) p->overlay_rgb_matrix[i][j] = matrix.m[i][j];
+        p->overlay_matrix_primaries = prim;
+        p->overlay_matrix_valid = true;
+    }
+    memcpy(color.rgb_matrix, p->overlay_rgb_matrix, sizeof(color.rgb_matrix));
 
     return color;
 }
@@ -2567,7 +2751,8 @@ static CVPixelBufferRef composite_yuv_frame(struct vo *vo, CVPixelBufferRef vide
         if (!create_output_pool(vo, videoW, videoH, sourceFormat))
             return NULL;
 
-        CVReturn status = avf_pool_get_buffer(p->outputPool, &outputBuffer);
+        CVReturn status = avf_pool_get_buffer_for_frame(vo, p->outputPool,
+                                                      &p->outputReservePool, &outputBuffer);
         if (status != kCVReturnSuccess || !outputBuffer) {
             MP_ERR(vo, "Failed to get YUV composite buffer: %d\n", status);
             return NULL;
@@ -2614,38 +2799,73 @@ static CVPixelBufferRef composite_yuv_frame(struct vo *vo, CVPixelBufferRef vide
     double cCenter = p010 ? 512.0 : 128.0;
     double cRange = fullRange ? (p010 ? 1023.0 : 255.0) : (p010 ? 896.0 : 224.0);
 
+    bool identity_mapping = src.x0 == dst.x0 && src.y0 == dst.y0 &&
+                            srcW == dstW && srcH == dstH;
     for (int cy = vy0 / 2; cy < (vy1 + 1) / 2; cy++) {
+        const uint8_t *subRows[2] = {NULL, NULL};
+        int rows = MPMIN(2, videoH - cy * 2);
+        for (int dy = 0; dy < rows; dy++) {
+            int y = cy * 2 + dy;
+            if (y < vy0 || y >= vy1)
+                continue;
+            int sy = identity_mapping ? y :
+                dst.y0 + (int)(((int64_t)(y - src.y0) * dstH) / srcH);
+            sy = MPCLAMP(sy, 0, subH - 1);
+            subRows[dy] = subBase + (size_t)sy * subStride;
+        }
         uint8_t *uvRow = uvBase + (size_t)cy * uvStride;
         for (int cx = vx0 / 2; cx < (vx1 + 1) / 2; cx++) {
+            int columns = MPMIN(2, videoW - cx * 2);
+            int count = rows * columns;
+            uint8_t bgra[4][4] = {{0}};
+            int xs[4], ys[4];
+            bool covered = false;
+            for (int dx = 0; dx < columns; dx++) {
+                int x = cx * 2 + dx;
+                if (x < vx0 || x >= vx1)
+                    continue;
+                int sx = identity_mapping ? x :
+                    dst.x0 + (int)(((int64_t)(x - src.x0) * dstW) / srcW);
+                sx = MPCLAMP(sx, 0, subW - 1);
+                for (int dy = 0; dy < rows; dy++) {
+                    if (!subRows[dy])
+                        continue;
+                    int i = dy * columns + dx;
+                    memcpy(bgra[i], subRows[dy] + (size_t)sx * 4, 4);
+                    xs[i] = x;
+                    ys[i] = cy * 2 + dy;
+                    covered |= bgra[i][3] != 0;
+                }
+            }
+            // Sparse subtitle bounds often contain mostly transparent cells.
+            // Do not read or normalize video samples until artwork covers one.
+            if (!covered)
+                continue;
+
             double uv[2];
             for (int k = 0; k < 2; k++) {
                 double code = p010 ? ((uint16_t *)uvRow)[2 * cx + k] >> 6 : uvRow[2 * cx + k];
                 uv[k] = (code - cCenter) / cRange;
             }
-            uint8_t bgra[4][4] = {{0}};
-            double luma[4];
-            int xs[4], ys[4], count = 0;
-            for (int dy = 0; dy < 2 && cy * 2 + dy < videoH; dy++) {
-                int y = cy * 2 + dy;
+            double luma[4] = {0};
+            for (int i = 0; i < count; i++) {
+                if (!bgra[i][3])
+                    continue;
+                int x = xs[i];
+                int y = ys[i];
                 uint8_t *yRow = yBase + (size_t)y * yStride;
-                for (int dx = 0; dx < 2 && cx * 2 + dx < videoW; dx++) {
-                    int x = cx * 2 + dx, i = count++;
-                    xs[i] = x; ys[i] = y;
-                    double code = p010 ? ((uint16_t *)yRow)[x] >> 6 : yRow[x];
-                    luma[i] = (code - yOffset) / yRange;
-                    if (x < vx0 || x >= vx1 || y < vy0 || y >= vy1) continue;
-                    int sx = MPCLAMP(dst.x0 + (int)(((int64_t)(x - src.x0) * dstW) / srcW), 0, subW - 1);
-                    int sy = MPCLAMP(dst.y0 + (int)(((int64_t)(y - src.y0) * dstH) / srcH), 0, subH - 1);
-                    memcpy(bgra[i], subBase + (size_t)sy * subStride + (size_t)sx * 4, 4);
-                }
+                double code = p010 ? ((uint16_t *)yRow)[x] >> 6 : yRow[x];
+                luma[i] = (code - yOffset) / yRange;
             }
             if (!avf_blend_chroma_cell(&color, bgra, luma, uv, count)) continue;
             for (int i = 0; i < count; i++) {
                 if (!bgra[i][3]) continue; // bit-exact untouched luma, including P010 low bits
-                uint8_t *yRow = yBase + (size_t)ys[i] * yStride;
+                int x = xs[i];
+                int y = ys[i];
+                uint8_t *yRow = yBase + (size_t)y * yStride;
                 double code = yOffset + yRange * luma[i];
-                if (p010) ((uint16_t *)yRow)[xs[i]] = clip_u10(code) << 6;
-                else yRow[xs[i]] = clip_u8(code);
+                if (p010) ((uint16_t *)yRow)[x] = clip_u10(code) << 6;
+                else yRow[x] = clip_u8(code);
             }
             for (int k = 0; k < 2; k++) {
                 double code = cCenter + cRange * uv[k];
@@ -2691,7 +2911,8 @@ static CVPixelBufferRef render_video_geometry_frame(struct vo *vo,
         return NULL;
 
     CVPixelBufferRef outputBuffer = NULL;
-    CVReturn status = avf_pool_get_buffer(p->outputPool, &outputBuffer);
+    CVReturn status = avf_pool_get_buffer_for_frame(vo, p->outputPool,
+                                                  &p->outputReservePool, &outputBuffer);
 
     if (status != kCVReturnSuccess || !outputBuffer) {
         MP_ERR(vo, "Failed to get geometry output buffer: %d\n", status);
@@ -2780,7 +3001,8 @@ static CVPixelBufferRef render_video_geometry_frame(struct vo *vo,
 }
 
 // GPU Core Image subtitle composite; HDR-compatible.
-static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuffer)
+static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
+                                       bool in_place)
 {
     struct priv *p = vo->priv;
 
@@ -2796,7 +3018,7 @@ static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuf
 
     OSType sourceFormat = CVPixelBufferGetPixelFormatType(videoBuffer);
     if (is_biplanar_yuv_format(sourceFormat)) {
-        CVPixelBufferRef composited = composite_yuv_frame(vo, videoBuffer, sourceFormat, false);
+        CVPixelBufferRef composited = composite_yuv_frame(vo, videoBuffer, sourceFormat, in_place);
         if (composited)
             return composited;
     }
@@ -2828,7 +3050,8 @@ static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuf
 
     // Acquire output buffer.
     CVPixelBufferRef outputBuffer = NULL;
-    CVReturn status = avf_pool_get_buffer(p->outputPool, &outputBuffer);
+    CVReturn status = avf_pool_get_buffer_for_frame(vo, p->outputPool,
+                                                  &p->outputReservePool, &outputBuffer);
 
     if (status != kCVReturnSuccess || !outputBuffer) {
         MP_ERR(vo, "Failed to get output buffer from pool: %d\n", status);
@@ -3066,6 +3289,7 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
 
         CVPixelBufferRef finalBuffer = pixbuf;
         bool needsRelease = false;
+        bool pixels_transformed = false;
 
         bool applyGeometry = should_apply_video_geometry(vo);
         // Native dvh1 RPU describes untouched frames. Core Image redraw
@@ -3083,11 +3307,14 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
         if (applyGeometry) {
             CVPixelBufferRef overlay = NULL;
             if (p->has_subtitle && is_biplanar_yuv_format(CVPixelBufferGetPixelFormatType(pixbuf)))
-                overlay = composite_yuv_frame(vo, pixbuf, CVPixelBufferGetPixelFormatType(pixbuf), false);
+                overlay = composite_yuv_frame(vo, pixbuf, CVPixelBufferGetPixelFormatType(pixbuf), pixbufNeedsRelease);
             CVPixelBufferRef rendered = render_video_geometry_frame(vo, overlay ?: pixbuf,
                                                                     !overlay && p->has_subtitle);
             if (overlay) {
-                p->video_statistics.pixel_buffer_copies++;
+                if (overlay != pixbuf)
+                    p->video_statistics.pixel_buffer_copies++;
+                else
+                    pixels_transformed = true;
                 CVPixelBufferRelease(overlay);
             }
             if (rendered) {
@@ -3104,6 +3331,7 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
                 }
                 finalBuffer = rendered;
                 needsRelease = true;
+                pixels_transformed = true;
                 p->applied_geometry_last_frame = true;
                 p->geometry_render_failure_logged = false;
             } else if (!p->geometry_render_failure_logged) {
@@ -3125,8 +3353,8 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
 
         if (!needsRelease && !applyGeometry && should_composite_into_video(p)) {
             // Composite this flip's subtitle.
-            CVPixelBufferRef composited = composite_frame(vo, pixbuf);
-            if (composited)
+            CVPixelBufferRef composited = composite_frame(vo, pixbuf, pixbufNeedsRelease);
+            if (composited && composited != pixbuf)
                 p->video_statistics.pixel_buffer_copies++;
             if (composited && should_use_frame_space_osd(p) &&
                 (CVPixelBufferGetWidth(composited) != CVPixelBufferGetWidth(pixbuf) ||
@@ -3149,6 +3377,7 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
             if (composited) {
                 finalBuffer = composited;
                 needsRelease = true;
+                pixels_transformed = true;
             }
         }
 
@@ -3219,7 +3448,7 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
         // Static source mastering metadata remains meaningful after an overlay,
         // but dynamic scene mapping describes the untouched original pixels.
         int hdr_state = avf_attach_hdr10plus(buf, hdr10plus, hdr10plus_size,
-                                           finalBuffer != pixbuf);
+                                           pixels_transformed);
         if (hdr_state != p->hdr10plus_state) {
             const char *states[] = {"absent", "attached", "invalid",
                                     "pixels-transformed", "os-unavailable"};
@@ -3330,6 +3559,8 @@ static void flip_page(struct vo *vo)
         p->video_statistics.sample_build_count++;
         p->video_statistics.last_sample_build_ns = sample_ns;
         p->video_statistics.total_sample_build_ns += sample_ns;
+        if (!video_buf)
+            record_deadline_drop(vo);
 
         bool osd_enqueued = !osd_needed;
 
@@ -3429,6 +3660,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                                     frame->ideal_frame_duration > 0.0
             ? MP_TIME_S_TO_NS(frame->ideal_frame_duration)
             : frame->duration > 0.0 ? (int64_t)llrint(frame->duration) : 0;
+        // Preserve the last scheduled interval for paused redraws and seeks.
+        if (frame_duration_ns > 0)
+            p->pool_frame_duration_ns = frame_duration_ns;
         p->next_timebase_rate_valid = avf_rate_sample(
             &p->rate_est, p->next_media_pts_ns, frame_duration_ns,
             p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
@@ -3478,6 +3712,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     p->dovi_validated_state = p->hdr10plus_state = 0;
     p->video_statistics = (struct voctrl_native_video_statistics){0};
     p->dovi_unsupported_logged = false;
+    clear_sw_upload_metadata(p);
 
     if (params->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
         params->imgfmt != IMGFMT_VIDEOTOOLBOX) {
@@ -3509,6 +3744,13 @@ static void uninit(struct vo *vo)
     }
 
     clear_subtitle_cache(p);
+
+    clear_sw_upload_metadata(p);
+
+    if (p->outputReservePool)
+        CVPixelBufferPoolRelease(p->outputReservePool);
+    if (p->swUploadReservePool)
+        CVPixelBufferPoolRelease(p->swUploadReservePool);
 
     if (p->outputPool) {
         CVPixelBufferPoolRelease(p->outputPool);

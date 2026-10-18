@@ -149,18 +149,6 @@ static inline void avf_tag_geometry(CVPixelBufferRef buffer, int pw, int ph,
     avf_set_attachment(buffer, kCVImageBufferCleanApertureKey, (__bridge CFDictionaryRef)aperture);
     CVBufferRemoveAttachment(buffer, kCVImageBufferPreferredCleanApertureKey);
 }
-static inline void copy_pixel_buffer_attachment(CVBufferRef src, CVBufferRef dst,
-                                         CFStringRef key)
-{
-    CVAttachmentMode mode = kCVAttachmentMode_ShouldPropagate;
-    CFTypeRef value = CVBufferGetAttachment(src, key, &mode);
-    if (value) {
-        CVBufferSetAttachment(dst, key, value, mode);
-    } else {
-        CVBufferRemoveAttachment(dst, key);
-    }
-}
-
 static inline void copy_pixel_buffer_metadata(CVPixelBufferRef src, CVPixelBufferRef dst,
                                        OSType dst_format)
 {
@@ -175,26 +163,6 @@ static inline void copy_pixel_buffer_metadata(CVPixelBufferRef src, CVPixelBuffe
         CFDictionaryRef dict = CVBufferGetAttachments(src, mode);
         if (dict) CVBufferSetAttachments(dst, dict, mode);
     }
-
-    const CFStringRef keys[] = {
-        kCVImageBufferCGColorSpaceKey,
-        kCVImageBufferICCProfileKey,
-        kCVImageBufferGammaLevelKey,
-        kCVImageBufferColorPrimariesKey,
-        kCVImageBufferTransferFunctionKey,
-        kCVImageBufferYCbCrMatrixKey,
-        kCVImageBufferMasteringDisplayColorVolumeKey,
-        kCVImageBufferContentLightLevelInfoKey,
-        kCVImageBufferChromaLocationTopFieldKey,
-        kCVImageBufferChromaLocationBottomFieldKey,
-        kCVImageBufferChromaSubsamplingKey,
-        kCVImageBufferCleanApertureKey,
-        kCVImageBufferPreferredCleanApertureKey,
-        kCVImageBufferPixelAspectRatioKey,
-    };
-
-    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
-        copy_pixel_buffer_attachment(src, dst, keys[i]);
 
     if (!biplanar) {
         CVBufferRemoveAttachment(dst, kCVImageBufferYCbCrMatrixKey);
@@ -215,6 +183,30 @@ static inline void copy_pixel_buffer_metadata(CVPixelBufferRef src, CVPixelBuffe
         set_colorspace_from_attachments(dst);
 }
 
+// Bounding the float backing avoids allocating a full 16-byte-per-pixel canvas
+// for sparse captions. Core Image supplies transparent pixels outside this data.
+struct avf_subtitle_bounds {
+    size_t x0, y0, x1, y1;
+};
+
+static inline struct avf_subtitle_bounds avf_find_subtitle_bounds(
+    const uint8_t *base, size_t width, size_t height, size_t stride)
+{
+    struct avf_subtitle_bounds bounds = {width, height, 0, 0};
+    for (size_t y = 0; y < height; y++) {
+        const uint8_t *row = base + y * stride;
+        size_t first = 0, last = width;
+        while (first < width && !row[first * 4 + 3]) first++;
+        if (first == width) continue;
+        while (last > first && !row[(last - 1) * 4 + 3]) last--;
+        if (first < bounds.x0) bounds.x0 = first;
+        if (last > bounds.x1) bounds.x1 = last;
+        if (y < bounds.y0) bounds.y0 = y;
+        bounds.y1 = y + 1;
+    }
+    return bounds.y1 ? bounds : (struct avf_subtitle_bounds){0};
+}
+
 static inline CIImage *avf_subtitle_image(CVPixelBufferRef sub, CGColorSpaceRef cs,
                                          const struct avf_overlay_color *color)
 {
@@ -222,29 +214,44 @@ static inline CIImage *avf_subtitle_image(CVPixelBufferRef sub, CGColorSpaceRef 
     size_t width = CVPixelBufferGetWidth(sub), height = CVPixelBufferGetHeight(sub);
     size_t stride = CVPixelBufferGetBytesPerRow(sub);
     const uint8_t *base = CVPixelBufferGetBaseAddress(sub);
-    NSMutableData *pixels = [NSMutableData dataWithLength:width * height * 4 * sizeof(float)];
-    if (!base || !pixels) {
+    if (!base) {
+        CVPixelBufferUnlockBaseAddress(sub, kCVPixelBufferLock_ReadOnly);
+        return nil;
+    }
+    struct avf_subtitle_bounds bounds = avf_find_subtitle_bounds(base, width, height, stride);
+    size_t crop_w = bounds.x1 - bounds.x0, crop_h = bounds.y1 - bounds.y0;
+    CIImage *canvas = [[CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0 alpha:0]]
+        imageByCroppingToRect:CGRectMake(0, 0, width, height)];
+    if (!crop_w || !crop_h) {
+        CVPixelBufferUnlockBaseAddress(sub, kCVPixelBufferLock_ReadOnly);
+        return canvas;
+    }
+    NSMutableData *pixels = [NSMutableData dataWithLength:crop_w * crop_h * 4 * sizeof(float)];
+    if (!pixels) {
         CVPixelBufferUnlockBaseAddress(sub, kCVPixelBufferLock_ReadOnly);
         return nil;
     }
     float *dst = pixels.mutableBytes;
-    for (size_t y = 0; y < height; y++) {
-        for (size_t x = 0; x < width; x++) {
+    for (size_t y = bounds.y0; y < bounds.y1; y++) {
+        for (size_t x = bounds.x0; x < bounds.x1; x++) {
             const uint8_t *bgra = base + y * stride + x * 4;
-            // NSMutableData starts zeroed; transparent canvas needs no color math.
             if (!bgra[3]) continue;
             double rgb[3];
             avf_subtitle_nits(color, bgra, rgb);
             avf_from_nits(color->transfer, rgb, color->kr, color->kb);
             float alpha = bgra[3] / 255.0f;
-            size_t offset = (y * width + x) * 4;
+            size_t offset = ((y - bounds.y0) * crop_w + x - bounds.x0) * 4;
             for (int c = 0; c < 3; c++) dst[offset + c] = rgb[c] * alpha;
             dst[offset + 3] = alpha;
         }
     }
     CVPixelBufferUnlockBaseAddress(sub, kCVPixelBufferLock_ReadOnly);
-    return [CIImage imageWithBitmapData:pixels bytesPerRow:width * 4 * sizeof(float)
-                                 size:CGSizeMake(width, height) format:kCIFormatRGBAf colorSpace:cs];
+    CIImage *image = [CIImage imageWithBitmapData:pixels bytesPerRow:crop_w * 4 * sizeof(float)
+        size:CGSizeMake(crop_w, crop_h) format:kCIFormatRGBAf colorSpace:cs];
+    image = [image imageByApplyingTransform:
+        CGAffineTransformMakeTranslation(bounds.x0, height - bounds.y1)];
+    // Preserve the original canvas extent for downstream geometry and scaling.
+    return [image imageByCompositingOverImage:canvas];
 }
 
 // Owned by the VO thread. The caller keeps the source bitmap immutable until
