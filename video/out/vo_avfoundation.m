@@ -44,6 +44,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
 #import <TargetConditionals.h>
+#include <pthread.h>
 
 
 struct avf_render_geometry {
@@ -82,7 +83,9 @@ struct avfoundation_opts {
     int presentation;
     int osd_max_height;
     double subtitle_luminance;
+    double subtitle_edr_gain;
     bool osd_video_res;
+    int osd_layer;
 };
 
 // --- avf sync servo core (host-testable; keep freestanding) ---
@@ -270,6 +273,8 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
 }
 // --- end avf sync servo core ---
 
+@class QuasarSubtitleLayer;
+
 struct priv {
     struct mp_hwdec_ctx hwctx;
     struct m_config_cache *opts_cache;
@@ -288,8 +293,8 @@ struct priv {
     bool next_timebase_rate_valid;
     __strong AVSampleBufferDisplayLayer *displayLayer;
 
-    // Timed AVSampleBufferDisplayLayer OSD/subtitles.
-    __strong AVSampleBufferDisplayLayer *osdLayer;
+    // Timed OSD/subtitles over untouched (Dolby Vision) frames.
+    QuasarSubtitleLayer *osdLayer;
     int64_t osd_change_id;
     int osd_w, osd_h;
     struct mp_osd_res osd_res;
@@ -386,6 +391,12 @@ struct priv {
     // OSD callback ran this frame.
     bool osd_callback_invoked;
 
+    // Current frame carries a Dolby Vision RPU; its pixels must stay
+    // untouched, so subtitles go to osdLayer instead.
+    bool frame_dovi;
+    bool osd_layer_active;
+    bool osd_layer_failed; // Metal setup failed; don't retry every frame
+
     // Previous frame used Core Image geometry; restore layer when zoom
     // resets.
     bool applied_geometry_last_frame;
@@ -416,8 +427,9 @@ static bool should_composite_into_video(struct priv *p)
 
 static bool should_use_inline_osd_layer(struct priv *p)
 {
-    return false;
+    return p->frame_dovi || p->opts->osd_layer == 1;
 }
+
 
 // Frame-space OSD: PiP presents samples directly and sizes its window from
 // them. Subtitles have no surrounding window margin.
@@ -548,6 +560,395 @@ static int64_t cm_time_to_ns(CMTime time)
                                           kCMTimeRoundingMethod_Default);
     return converted.value;
 }
+
+// Subtitles over frames whose pixels must stay untouched (Dolby Vision RPU),
+// drawn on a transparent CAMetalLayer above the
+// display layer. Cues arrive as the timed BGRA samples the display layer
+// would get; a display link shows the newest one whose PTS the shared
+// timebase has reached. gain > 1 lifts opaque subtitle pixels into EDR
+// (1.0 = SDR white, capped at 2.0). Thread use: enqueue/flush/setGain from
+// the VO thread, everything touching the layer or Metal on main.
+// The OSD pool's cap (AVF_POOL_MAX_BUFFERS); the display link drains due
+// entries, so the queue only holds what the VO has queued ahead.
+#define QSUB_QUEUE_MAX 32
+
+static NSString *const qsub_shader_source =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct VOut { float4 pos [[position]]; float2 uv; };\n"
+     "vertex VOut qsub_vertex(uint vid [[vertex_id]]) {\n"
+     "    float2 p = float2((vid & 1) ? 1.0 : -1.0, (vid & 2) ? -1.0 : 1.0);\n"
+     "    VOut o; o.pos = float4(p, 0.0, 1.0);\n"
+     "    o.uv = float2((vid & 1) ? 1.0 : 0.0, (vid & 2) ? 1.0 : 0.0);\n"
+     "    return o;\n"
+     "}\n"
+     // BGRA OSD is premultiplied sRGB. Decode to linear for the extended
+     // linear sRGB drawable; boost only the opaque body so antialiased edges
+     // and soft outlines stay SDR.
+     "fragment float4 qsub_fragment(VOut in [[stage_in]],\n"
+     "                              texture2d<float> tex [[texture(0)]],\n"
+     "                              constant float &gain [[buffer(0)]]) {\n"
+     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+     "    float4 c = tex.sample(s, in.uv);\n"
+     "    float a = c.a;\n"
+     "    if (a <= 3.0 / 255.0) return float4(0.0);\n"
+     "    float3 u = min(c.rgb, float3(a)) / a;\n"
+     "    float3 lin = select(pow((u + 0.055) / 1.055, 2.4), u / 12.92, u <= 0.04045);\n"
+     "    float boost = gain <= 1.0 ? gain : mix(1.0, gain, smoothstep(0.20, 0.85, a));\n"
+     "    return float4(lin * a * boost, a);\n"
+     "}\n";
+
+@interface QuasarSubtitleLayer : NSObject {
+@public
+    CAMetalLayer *_layer;
+@private
+    CMTimebaseRef _timebase;
+    id<MTLDevice> _device;
+    id<MTLCommandQueue> _queue;
+    id<MTLRenderPipelineState> _pipeline;
+    CVMetalTextureCacheRef _textureCache;
+    CADisplayLink *_link;
+    pthread_mutex_t _lock;
+    struct { int64_t pts_ns; CVPixelBufferRef buf; bool immediate; } _entries[QSUB_QUEUE_MAX];
+    int _count;
+    bool _clearPending;
+    float _gain;
+    float _appliedGain;
+    CVPixelBufferRef _current;
+    struct mp_log *_log;
+    bool _loggedFirst;
+}
+- (instancetype)initWithTimebase:(CMTimebaseRef)timebase gain:(double)gain
+                             log:(struct mp_log *)log;
+- (void)enqueueSampleBuffer:(CMSampleBufferRef)buf;
+- (void)flushRemovingImage:(BOOL)remove;
+- (void)setGain:(double)gain;
+- (void)attachToDisplayLayer:(AVSampleBufferDisplayLayer *)displayLayer;
+- (void)invalidate;
+@end
+
+@implementation QuasarSubtitleLayer
+
+// Main-thread logging. vo->log dies with the VO right after -invalidate, and
+// the main-thread blocks can run later, so -invalidate clears _log under _lock.
+- (void)logMain:(int)lev format:(const char *)fmt, ...
+{
+    pthread_mutex_lock(&_lock);
+    if (_log) {
+        va_list va;
+        va_start(va, fmt);
+        mp_msg_va(_log, lev, fmt, va);
+        va_end(va);
+    }
+    pthread_mutex_unlock(&_lock);
+}
+
+- (instancetype)initWithTimebase:(CMTimebaseRef)timebase gain:(double)gain
+                             log:(struct mp_log *)log
+{
+    if (!(self = [super init]))
+        return nil;
+    _log = log;
+    pthread_mutex_init(&_lock, NULL);
+    _timebase = timebase ? (CMTimebaseRef)CFRetain(timebase) : NULL;
+    _gain = (float)gain;
+    _appliedGain = -1;
+    _device = MTLCreateSystemDefaultDevice();
+    if (!_device) {
+        [self release];
+        return nil;
+    }
+    _queue = [_device newCommandQueue];
+    NSError *err = nil;
+    id<MTLLibrary> lib = [_device newLibraryWithSource:qsub_shader_source
+                                               options:nil error:&err];
+    MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+    desc.vertexFunction = [[lib newFunctionWithName:@"qsub_vertex"] autorelease];
+    desc.fragmentFunction = [[lib newFunctionWithName:@"qsub_fragment"] autorelease];
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+    _pipeline = lib ? [_device newRenderPipelineStateWithDescriptor:desc error:&err] : nil;
+    if (!_pipeline)
+        mp_msg(_log, MSGL_ERR, "Subtitle layer shader failed: %s\n",
+               err.localizedDescription.UTF8String ?: "?");
+    [desc release];
+    [lib release];
+    if (!_pipeline ||
+        CVMetalTextureCacheCreate(NULL, NULL, _device, NULL, &_textureCache) != kCVReturnSuccess) {
+        [self release];
+        return nil;
+    }
+    return self;
+}
+
+// Main thread only. A CAMetalLayer created on the VO thread never shows its
+// presented drawables (its implicit transaction has no run loop to commit
+// it), so the layer is made on main at first attach.
+- (CAMetalLayer *)layer
+{
+    if (!_layer) {
+        _layer = [[CAMetalLayer alloc] init];
+        _layer.device = _device;
+        _layer.pixelFormat = MTLPixelFormatRGBA16Float;
+        _layer.framebufferOnly = YES;
+        _layer.opaque = NO;
+        _layer.hidden = YES;
+        _layer.zPosition = 1;
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
+        _layer.colorspace = cs;
+        CGColorSpaceRelease(cs);
+    }
+    return _layer;
+}
+
+- (void)dealloc
+{
+    for (int i = 0; i < _count; i++)
+        CVPixelBufferRelease(_entries[i].buf);
+    CVPixelBufferRelease(_current);
+    if (_textureCache)
+        CFRelease(_textureCache);
+    if (_timebase)
+        CFRelease(_timebase);
+    [_layer release];
+    [_pipeline release];
+    [_queue release];
+    [_device release];
+    pthread_mutex_destroy(&_lock);
+    [super dealloc];
+}
+
+- (void)wake
+{
+    [self retain];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self->_link) {
+            self->_link = [[CADisplayLink displayLinkWithTarget:self
+                                                       selector:@selector(tick:)] retain];
+            [self->_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+            [self logMain:MSGL_V format:"Subtitle layer: display link started\n"];
+        }
+        self->_link.paused = NO;
+        [self release];
+    });
+}
+
+- (void)enqueueSampleBuffer:(CMSampleBufferRef)buf
+{
+    CVPixelBufferRef pix = CMSampleBufferGetImageBuffer(buf);
+    bool immediate = false;
+    CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(buf, false);
+    if (att && CFArrayGetCount(att) > 0) {
+        CFDictionaryRef d = CFArrayGetValueAtIndex(att, 0);
+        immediate = CFDictionaryGetValue(d, kCMSampleAttachmentKey_DisplayImmediately) == kCFBooleanTrue;
+    }
+    pthread_mutex_lock(&_lock);
+    if (_count == QSUB_QUEUE_MAX) {
+        CVPixelBufferRelease(_entries[0].buf);
+        memmove(&_entries[0], &_entries[1], sizeof(_entries[0]) * (QSUB_QUEUE_MAX - 1));
+        _count--;
+    }
+    _entries[_count].pts_ns = cm_time_to_ns(CMSampleBufferGetPresentationTimeStamp(buf));
+    _entries[_count].buf = CVPixelBufferRetain(pix);
+    _entries[_count].immediate = immediate;
+    _count++;
+    mp_msg(_log, MSGL_DEBUG, "Subtitle layer enqueue pts=%.3f immediate=%d buf=%p\n",
+           _entries[_count - 1].pts_ns / 1e9, immediate, pix);
+    pthread_mutex_unlock(&_lock);
+    [self wake];
+}
+
+- (void)flushRemovingImage:(BOOL)remove
+{
+    pthread_mutex_lock(&_lock);
+    for (int i = 0; i < _count; i++)
+        CVPixelBufferRelease(_entries[i].buf);
+    _count = 0;
+    if (remove)
+        _clearPending = true;
+    pthread_mutex_unlock(&_lock);
+    mp_msg(_log, MSGL_DEBUG, "Subtitle layer flush remove=%d\n", remove);
+    if (remove)
+        [self wake];
+}
+
+- (void)setGain:(double)gain
+{
+    pthread_mutex_lock(&_lock);
+    _gain = (float)gain;
+    pthread_mutex_unlock(&_lock);
+    [self wake];
+}
+
+// EDR only while gain > 1; headroom = gain on iOS 26+.
+- (void)applyGain:(float)gain
+{
+    if (gain == _appliedGain)
+        return;
+    _appliedGain = gain;
+    BOOL hdr = gain > 1.0f;
+#if !TARGET_OS_TV
+    _layer.wantsExtendedDynamicRangeContent = hdr;
+#endif
+    if (@available(iOS 26.0, tvOS 26.0, macOS 26.0, *)) {
+        _layer.preferredDynamicRange = hdr ? CADynamicRangeHigh : CADynamicRangeStandard;
+        _layer.contentsHeadroom = hdr ? gain : 0;
+    }
+    [self logMain:MSGL_V format:"Subtitle layer gain=%.2f EDR=%s\n", gain, hdr ? "on" : "off"];
+}
+
+- (void)tick:(CADisplayLink *)link
+{
+    [self layer];
+    int64_t now = 0;
+    if (_timebase) {
+        double rate = CMTimebaseGetRate(_timebase);
+        now = cm_time_to_ns(CMTimebaseGetTime(_timebase)) +
+            (int64_t)((link.targetTimestamp - CACurrentMediaTime()) * rate * 1e9);
+    }
+
+    pthread_mutex_lock(&_lock);
+    int pick = -1;
+    for (int i = 0; i < _count; i++) {
+        if (_entries[i].immediate || _entries[i].pts_ns <= now)
+            pick = i;
+    }
+    CVPixelBufferRef next = pick >= 0 ? CVPixelBufferRetain(_entries[pick].buf) : NULL;
+    for (int i = 0; i <= pick; i++)
+        CVPixelBufferRelease(_entries[i].buf);
+    if (pick >= 0) {
+        memmove(&_entries[0], &_entries[pick + 1], sizeof(_entries[0]) * (_count - pick - 1));
+        _count -= pick + 1;
+    }
+    bool clear = _clearPending;
+    _clearPending = false;
+    float gain = _gain;
+    bool idle = _count == 0;
+    pthread_mutex_unlock(&_lock);
+
+    bool redraw = gain != _appliedGain;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [self applyGain:gain];
+    if (clear && pick < 0) {
+        CVPixelBufferRelease(_current);
+        _current = NULL;
+    }
+    if (pick >= 0) {
+        CVPixelBufferRelease(_current);
+        _current = next;
+        redraw = true;
+    }
+    if (redraw || clear)
+        [self draw:gain];
+    [CATransaction commit];
+    if (idle)
+        link.paused = YES;
+}
+
+// An empty OSD sample (cue ended) is a fully transparent buffer; hiding the
+// layer covers it and the cleared state without a GPU pass.
+- (void)draw:(float)gain
+{
+    CVPixelBufferRef buf = _current;
+    if (!buf) {
+        _layer.hidden = YES;
+        return;
+    }
+    size_t w = CVPixelBufferGetWidth(buf), h = CVPixelBufferGetHeight(buf);
+    CVMetalTextureRef texRef = NULL;
+    if (CVMetalTextureCacheCreateTextureFromImage(NULL, _textureCache, buf, NULL,
+            MTLPixelFormatBGRA8Unorm, w, h, 0, &texRef) != kCVReturnSuccess) {
+        [self logMain:MSGL_WARN format:"Subtitle layer: cannot map OSD buffer to Metal\n"];
+        return;
+    }
+    if (!CGSizeEqualToSize(_layer.drawableSize, CGSizeMake(w, h)))
+        _layer.drawableSize = CGSizeMake(w, h);
+    id<CAMetalDrawable> drawable = [_layer nextDrawable];
+    if (!drawable) {
+        [self logMain:MSGL_WARN format:"Subtitle layer: no drawable (layer %.0fx%.0f)\n",
+               _layer.bounds.size.width, _layer.bounds.size.height];
+        CFRelease(texRef);
+        return;
+    }
+    if (!_loggedFirst) {
+        _loggedFirst = true;
+        [self logMain:MSGL_V format:"Subtitle layer: first cue %zux%zu gain=%.2f layer=%.0fx%.0f "
+               "superlayer=%s\n", w, h, gain, _layer.bounds.size.width,
+               _layer.bounds.size.height, _layer.superlayer ? "yes" : "no"];
+    }
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = drawable.texture;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    id<MTLCommandBuffer> cmd = [_queue commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+    [enc setRenderPipelineState:_pipeline];
+    [enc setFragmentTexture:CVMetalTextureGetTexture(texRef) atIndex:0];
+    [enc setFragmentBytes:&gain length:sizeof(gain) atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    [enc endEncoding];
+    CVPixelBufferRetain(buf);
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        CFRelease(texRef);
+        CVPixelBufferRelease(buf);
+    }];
+    [cmd presentDrawable:drawable];
+    [cmd commit];
+    _layer.hidden = NO;
+}
+
+- (void)attachToDisplayLayer:(AVSampleBufferDisplayLayer *)displayLayer
+{
+    if (!displayLayer)
+        return;
+    [self retain];
+    [displayLayer retain];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CAMetalLayer *layer = [self layer];
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        if (layer.superlayer != displayLayer)
+            [displayLayer addSublayer:layer];
+        if (!CGRectEqualToRect(layer.frame, displayLayer.bounds))
+            layer.frame = displayLayer.bounds;
+        // The OSD buffer is frame-space (video size), so the same gravity
+        // puts it on the video rect.
+        NSString *g = displayLayer.videoGravity;
+        NSString *cg = [g isEqualToString:AVLayerVideoGravityResizeAspectFill]
+            ? kCAGravityResizeAspectFill
+            : [g isEqualToString:AVLayerVideoGravityResize] ? kCAGravityResize
+                                                           : kCAGravityResizeAspect;
+        if (![layer.contentsGravity isEqualToString:cg])
+            layer.contentsGravity = cg;
+        [CATransaction commit];
+        [self release];
+        [displayLayer release];
+    });
+}
+
+// Never sync-enter main from the VO (libmpv teardown may wait on it); the
+// async block runs after every pending attach.
+- (void)invalidate
+{
+    [self flushRemovingImage:NO];
+    pthread_mutex_lock(&_lock);
+    _log = NULL;
+    pthread_mutex_unlock(&_lock);
+    [self retain];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self->_link invalidate];
+        [self->_link release];
+        self->_link = nil;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        [self->_layer removeFromSuperlayer];
+        [CATransaction commit];
+        [self release];
+    });
+}
+
+@end
 
 // Anchor with immediate CoreMedia source clock. mpv timestamps use
 // mp_time_ns() epoch, not CM host time.
@@ -766,7 +1167,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
 {
     struct priv *p = vo->priv;
     AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
-    AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
+    QuasarSubtitleLayer *osdLayer = [p->osdLayer retain];
 
     if (!displayLayer) {
         [osdLayer release];
@@ -799,7 +1200,7 @@ static void recover_display_layer(struct vo *vo, const char *reason, bool force)
         }
 
         sample_buffer_renderer_flush(displayLayer, false);
-        sample_buffer_renderer_flush(osdLayer, false);
+        [osdLayer flushRemovingImage:NO];
     }
 
     MP_WARN(vo, "Recovered AVFoundation display layer after %s "
@@ -1012,8 +1413,10 @@ static struct avf_render_geometry get_render_geometry(struct vo *vo,
 // Sync OSD and display layer frames.
 static void sync_osd_layer_frame(struct vo *vo)
 {
+    struct priv *p = vo->priv;
     update_avfoundation_geometry(vo);
     invalidate_render_geometry(vo);
+    [p->osdLayer attachToDisplayLayer:p->displayLayer];
 }
 
 static void avfoundation_opts_wakeup(void *ctx)
@@ -1034,6 +1437,7 @@ static void update_avfoundation_options(struct vo *vo)
     int old_osd_max_height = p->opts->osd_max_height;
     bool old_osd_video_res = p->opts->osd_video_res;
     double old_subtitle_luminance = p->opts->subtitle_luminance;
+    int old_osd_layer = p->opts->osd_layer;
 
     if (!m_config_cache_update(p->opts_cache))
         return;
@@ -1043,7 +1447,8 @@ static void update_avfoundation_options(struct vo *vo)
 
     bool composite_changed =
         old_composite_osd != p->opts->composite_osd ||
-        old_pip_composite_osd != p->opts->pip_composite_osd;
+        old_pip_composite_osd != p->opts->pip_composite_osd ||
+        old_osd_layer != p->opts->osd_layer;
     bool osd_scale_changed = old_osd_max_height != p->opts->osd_max_height ||
         old_osd_video_res != p->opts->osd_video_res;
 
@@ -1067,8 +1472,8 @@ static void update_avfoundation_options(struct vo *vo)
     clear_subtitle_cache(p);
     if (composite_changed && !should_composite_into_video(p))
         release_ci_compositor(p);
-    if (p->osdLayer)
-        sample_buffer_renderer_flush(p->osdLayer, true);
+    [p->osdLayer flushRemovingImage:YES];
+    [p->osdLayer setGain:p->opts->subtitle_edr_gain];
     sync_osd_layer_frame(vo);
 }
 
@@ -2341,7 +2746,12 @@ static CVPixelBufferRef create_empty_osd_pixel_buffer(struct vo *vo)
         return NULL;
 
     CVPixelBufferRef pixbuf = NULL;
-    CVReturn status = avf_pool_get_buffer(p->osdPool, &pixbuf);
+    // With the subtitle layer, animated ASS queues one buffer per video
+    // frame ahead, plus the one on screen and one still on the GPU.
+    int limit = avf_presentation_pool_limit(p->opts->queue_lead_ms,
+        p->pool_frame_duration_ns, p->presentation_host) + 2;
+    CVReturn status = avf_pool_get_buffer_with_limit(p->osdPool,
+        MPMIN(limit, AVF_POOL_MAX_BUFFERS), &pixbuf);
 
     if (status != kCVReturnSuccess || !pixbuf) {
         MP_ERR(vo, "Failed to get OSD overlay buffer: %d\n", status);
@@ -2479,6 +2889,18 @@ static CMSampleBufferRef create_osd_sample_buffer(struct vo *vo,
         return NULL;
     }
 
+    // Same rule as video: a stopped timebase cannot pass an equal-PTS
+    // replacement, so paused cue changes display immediately.
+    // ponytail: no pixel-aspect attachment; Dolby Vision is square-pixel.
+    if (p->playback_paused && !p->presentation_host) {
+        CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(buf, true);
+        if (attachments && CFArrayGetCount(attachments) > 0) {
+            CFDictionarySetValue((CFMutableDictionaryRef)
+                CFArrayGetValueAtIndex(attachments, 0),
+                kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+        }
+    }
+
     return buf;
 }
 
@@ -2489,19 +2911,9 @@ static bool enqueue_osd_sample(struct vo *vo, CMSampleBufferRef buf)
     if (!buf)
         return true;
 
-    AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
-    if (!osdLayer)
+    if (!p->osdLayer)
         return false;
-
-    if (!sample_buffer_renderer_is_ready(osdLayer)) {
-        MP_VERBOSE(vo, "OSD layer not ready; dropping subtitle sample for this frame\n");
-        [osdLayer release];
-        return false;
-    }
-
-    sample_buffer_renderer_enqueue(osdLayer, buf);
-    [osdLayer release];
-
+    [p->osdLayer enqueueSampleBuffer:buf];
     return true;
 }
 
@@ -2531,8 +2943,12 @@ static bool render_osd_with_geometry(struct vo *vo, double pts,
         talloc_free(list);
         return true;
     }
+    // A cue that just ended (or a clear that failed to enqueue) still needs
+    // an empty sample on osdLayer.
+    bool clear_pending = p->osd_needs_enqueue || p->has_subtitle;
     clear_subtitle_cache(p);
     if (!list->num_items) {
+        p->osd_needs_enqueue = clear_pending;
         talloc_free(list);
         return true;
     }
@@ -2592,6 +3008,7 @@ static bool render_osd_with_geometry(struct vo *vo, double pts,
     osd_buf_record_dirty(p, buf, bounds);
     p->osd_change_id = list->change_id;
     p->has_subtitle = true;
+    p->osd_needs_enqueue = true;
     p->perf.renders++;
     int64_t elapsed = mp_time_ns() - start;
     p->perf.total_ns += elapsed;
@@ -3006,7 +3423,7 @@ static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuf
 {
     struct priv *p = vo->priv;
 
-    if (!p->has_subtitle)
+    if (!p->has_subtitle || should_use_inline_osd_layer(p))
         return NULL;
     if (CVBufferGetAttachment(videoBuffer, CFSTR("DolbyVisionRPUData"), NULL)) {
         if (!p->dovi_geometry_skip_logged) {
@@ -3545,6 +3962,38 @@ static void flip_page(struct vo *vo)
         CMSampleBufferRef osd_buf = NULL;
         bool osd_needed = false;
 
+        bool osd_layer = should_use_inline_osd_layer(p);
+        if (osd_layer && !p->osdLayer && !p->osd_layer_failed) {
+            // Off-main alloc and controlTimebase match preinit's displayLayer
+            // setup; CALayer tree changes happen on main.
+            p->osdLayer = [[QuasarSubtitleLayer alloc]
+                initWithTimebase:p->timebase gain:p->opts->subtitle_edr_gain
+                             log:vo->log];
+            if (!p->osdLayer) {
+                MP_ERR(vo, "Failed to create the subtitle Metal layer\n");
+                p->osd_layer_failed = true;
+            }
+        }
+        if (osd_layer != p->osd_layer_active) {
+            MP_INFO(vo, "Subtitles %s\n", osd_layer ? "on separate OSD layer"
+                                                      : "composited into video");
+            p->osd_layer_active = osd_layer;
+            // Entering: push the current cue (or an empty sample). Leaving:
+            // drop the layer's overlay; composition takes over.
+            if (osd_layer)
+                p->osd_needs_enqueue = true;
+            else
+                [p->osdLayer flushRemovingImage:YES];
+        }
+        if (osd_layer) {
+            [p->osdLayer attachToDisplayLayer:p->displayLayer];
+            if (p->playback_paused && !p->presentation_host) {
+                // Same as the video flush above; re-send this frame's cue.
+                [p->osdLayer flushRemovingImage:NO];
+                p->osd_change_id = 0;
+            }
+        }
+
         // Enqueue OSD immediately before matching video. Slow subtitle
         // rendering delays both, preserving frame alignment.
         render_osd(vo, p->next_pts);
@@ -3643,6 +4092,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     p->next_image = mp_image_new_ref(frame->current);
     if (!p->next_image)
         return false;
+    p->frame_dovi = p->next_image->imgfmt == IMGFMT_VIDEOTOOLBOX &&
+        p->next_image->planes[3] &&
+        CVBufferGetAttachment((CVPixelBufferRef)p->next_image->planes[3],
+                              CFSTR("DolbyVisionRPUData"), NULL);
 
     double pts = p->next_image->pts;
     if (pts == MP_NOPTS_VALUE)
@@ -3735,7 +4188,11 @@ static void uninit(struct vo *vo)
 
     mp_image_unrefp(&p->next_image);
     sample_buffer_renderer_flush(p->displayLayer, true);
-    sample_buffer_renderer_flush(p->osdLayer, true);
+    if (p->osdLayer) {
+        [p->osdLayer invalidate];
+        [p->osdLayer release];
+        p->osdLayer = nil;
+    }
 
     if (p->timebase) {
         p->displayLayer.controlTimebase = NULL;
@@ -3830,7 +4287,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
         p->playback_paused = was_paused;
         p->timebase_paused = was_paused;
         sample_buffer_renderer_flush(p->displayLayer, false);
-        sample_buffer_renderer_flush(p->osdLayer, true);
+        [p->osdLayer flushRemovingImage:YES];
         if (p->presentation_host && p->timebase) {
             // Fresh host samples have future timestamps. Free-running clock
             // needs only reseed if CoreMedia clamped it between videos.
@@ -3877,6 +4334,9 @@ static const struct m_option avfoundation_options[] = {
     {"native-dovi-profile7", OPT_CHOICE(native_dovi_profile7,
         {"no", 0}, {"p8.1", 1})},
     {"composite-osd", OPT_BOOL(composite_osd)},
+    // auto: separate OSD layer only for Dolby Vision RPU frames (pixels
+    // must stay untouched). always: for every frame (simulator testing).
+    {"osd-layer", OPT_CHOICE(osd_layer, {"auto", 0}, {"always", 1})},
     {"pip-composite-osd", OPT_BOOL(pip_composite_osd)},
     {"queue-lead-ms", OPT_INT(queue_lead_ms), M_RANGE(0, 1000)},
     {"presentation", OPT_CHOICE(presentation,
@@ -3886,6 +4346,9 @@ static const struct m_option avfoundation_options[] = {
     // result.
     {"osd-max-height", OPT_INT(osd_max_height), M_RANGE(0, 4320)},
     {"subtitle-luminance", OPT_DOUBLE(subtitle_luminance), M_RANGE(1, 1000)},
+    // Subtitle layer brightness relative to SDR white (HDR subtitle
+    // exposure); > 1 turns on EDR for that layer.
+    {"subtitle-edr-gain", OPT_DOUBLE(subtitle_edr_gain), M_RANGE(0, 2)},
     // Rasterize at video pixel density: 1:1 over displayed video rect.
     {"osd-video-res", OPT_BOOL(osd_video_res)},
     {0},
@@ -3901,6 +4364,7 @@ static const struct m_sub_options avfoundation_conf = {
         .pip_composite_osd = true,
         .queue_lead_ms = 128,
         .subtitle_luminance = 203,
+        .subtitle_edr_gain = 1.0,
         // tvOS has no PiP. Use host timebase to avoid accumulated drift
         // against mpv's audio-slaved schedule (plezy#1776).
         .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
