@@ -820,7 +820,7 @@ avfoundation = dependency('appleframeworks', modules: ['CoreMedia', 'AVFoundatio
 features += {'avfoundation': avfoundation.found()}
 if features['avfoundation']
     dependencies += avfoundation
-    sources += files('audio/out/ao_avfoundation.m')
+    sources += files('audio/out/ao_avfoundation.m', 'audio/out/ao_avfoundation_avplayer.m')
 endif
 
 vo_avfoundation_frameworks = ['AVFoundation', 'CoreMedia', 'CoreVideo',

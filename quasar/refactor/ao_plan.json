@@ -1,0 +1,256 @@
+{
+ "segments": [
+  {
+   "from": 43,
+   "to": 49,
+   "target": "H",
+   "decl": 43,
+   "fn": null
+  },
+  {
+   "from": 50,
+   "to": 58,
+   "target": "H",
+   "decl": 50,
+   "fn": null
+  },
+  {
+   "from": 59,
+   "to": 152,
+   "target": "H",
+   "decl": 59,
+   "fn": null
+  },
+  {
+   "from": 153,
+   "to": 162,
+   "target": "HI",
+   "decl": 154,
+   "fn": "spatial_formats"
+  },
+  {
+   "from": 163,
+   "to": 194,
+   "target": "H",
+   "decl": 163,
+   "fn": null
+  },
+  {
+   "from": 195,
+   "to": 196,
+   "target": "M",
+   "decl": 195,
+   "fn": null
+  },
+  {
+   "from": 197,
+   "to": 198,
+   "target": "M",
+   "decl": 197,
+   "fn": null
+  },
+  {
+   "from": 199,
+   "to": 204,
+   "target": "HI",
+   "decl": 199,
+   "fn": "CMTimeGetNanoseconds"
+  },
+  {
+   "from": 205,
+   "to": 209,
+   "target": "M",
+   "decl": 205,
+   "fn": "CMTimeFromNanoseconds"
+  },
+  {
+   "from": 210,
+   "to": 215,
+   "target": "HI",
+   "decl": 210,
+   "fn": "avp_timer_idle"
+  },
+  {
+   "from": 216,
+   "to": 223,
+   "target": "HI",
+   "decl": 216,
+   "fn": "avp_timer_arm"
+  },
+  {
+   "from": 224,
+   "to": 237,
+   "target": "AVP",
+   "decl": 225,
+   "fn": "spdif_reload"
+  },
+  {
+   "from": 238,
+   "to": 257,
+   "target": "AVP",
+   "decl": 241,
+   "fn": "avp_current_time_ns"
+  },
+  {
+   "from": 258,
+   "to": 274,
+   "target": "AVP",
+   "decl": 262,
+   "fn": "avp_feed_position_ns"
+  },
+  {
+   "from": 275,
+   "to": 312,
+   "target": "AVP",
+   "decl": 276,
+   "fn": "avp_append_es"
+  },
+  {
+   "from": 313,
+   "to": 374,
+   "target": "AVP",
+   "decl": 315,
+   "fn": "avp_pull"
+  },
+  {
+   "from": 375,
+   "to": 483,
+   "target": "AVP",
+   "decl": 376,
+   "fn": "avp_serve_requests"
+  },
+  {
+   "from": 484,
+   "to": 500,
+   "target": "AVP",
+   "decl": 487,
+   "fn": "avp_apply_volume"
+  },
+  {
+   "from": 501,
+   "to": 569,
+   "target": "AVP",
+   "decl": 503,
+   "fn": "avp_update_transport"
+  },
+  {
+   "from": 570,
+   "to": 604,
+   "target": "AVP",
+   "decl": 573,
+   "fn": "avp_stream_tail_drained"
+  },
+  {
+   "from": 605,
+   "to": 635,
+   "target": "AVP",
+   "decl": 608,
+   "fn": "avp_publish_clock"
+  },
+  {
+   "from": 636,
+   "to": 702,
+   "target": "AVP",
+   "decl": 637,
+   "fn": "feed_avp"
+  },
+  {
+   "from": 703,
+   "to": 743,
+   "target": "AVP",
+   "decl": 705,
+   "fn": "avp_create_item"
+  },
+  {
+   "from": 744,
+   "to": 784,
+   "target": "AVP",
+   "decl": 744,
+   "fn": "avp_teardown_item"
+  },
+  {
+   "from": 785,
+   "to": 848,
+   "target": "M",
+   "decl": 785,
+   "fn": null
+  },
+  {
+   "from": 849,
+   "to": 940,
+   "target": "M",
+   "decl": 849,
+   "fn": "feed"
+  },
+  {
+   "from": 941,
+   "to": 983,
+   "target": "M",
+   "decl": 941,
+   "fn": "start"
+  },
+  {
+   "from": 984,
+   "to": 1010,
+   "target": "M",
+   "decl": 984,
+   "fn": "stop"
+  },
+  {
+   "from": 1011,
+   "to": 1064,
+   "target": "M",
+   "decl": 1011,
+   "fn": "set_pause"
+  },
+  {
+   "from": 1065,
+   "to": 1147,
+   "target": "M",
+   "decl": 1065,
+   "fn": "control"
+  },
+  {
+   "from": 1148,
+   "to": 1172,
+   "target": "M",
+   "decl": 1148,
+   "fn": null
+  },
+  {
+   "from": 1173,
+   "to": 1230,
+   "target": "AVP",
+   "decl": 1173,
+   "fn": null
+  },
+  {
+   "from": 1231,
+   "to": 1490,
+   "target": "M",
+   "decl": 1231,
+   "fn": "init"
+  },
+  {
+   "from": 1491,
+   "to": 1533,
+   "target": "M",
+   "decl": 1491,
+   "fn": "uninit"
+  },
+  {
+   "from": 1534,
+   "to": 1570,
+   "target": "M",
+   "decl": 1534,
+   "fn": null
+  }
+ ],
+ "exported": {
+  "avp_apply_volume": "ao_avf_avp_apply_volume",
+  "avp_publish_clock": "ao_avf_avp_publish_clock",
+  "feed_avp": "ao_avf_feed_avp",
+  "avp_create_item": "ao_avf_avp_create_item",
+  "avp_teardown_item": "ao_avf_avp_teardown_item"
+ }
+}
