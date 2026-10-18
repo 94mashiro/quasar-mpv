@@ -443,6 +443,31 @@ static int mp_property_generic_option(void *ctx, struct m_property *prop,
     return M_PROPERTY_NOT_IMPLEMENTED;
 }
 
+// Return VO external-resize result synchronously through libmpv properties;
+// option bridge drops VOCTRL result.
+static int mp_property_external_surface_size(void *ctx,
+                                             struct m_property *prop,
+                                             int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    bool live = strcmp(prop->name, "external-surface-size-live") == 0;
+    struct m_property option = *prop;
+    option.name = "external-surface-size";
+    if (action != M_PROPERTY_SET)
+        return mp_property_generic_option(ctx, &option, action, arg);
+
+    int result = mp_property_generic_option(ctx, &option, action, arg);
+    if (result <= 0)
+        return result;
+
+    // Invoke exactly once, including equal sizes used to refresh color state.
+    // force_update on the option echoes through config caches and can rebuild
+    // the same swapchain again after this synchronous request has returned.
+    int resized = mpctx->video_out
+        ? vo_control(mpctx->video_out, VOCTRL_EXTERNAL_RESIZE, live ? &live : NULL) : VO_TRUE;
+    return resized > 0 ? M_PROPERTY_OK : M_PROPERTY_ERROR;
+}
+
 /// Playback speed (RW)
 static int mp_property_playback_speed(void *ctx, struct m_property *prop,
                                       int action, void *arg)
@@ -4411,6 +4436,8 @@ static const struct m_property mp_properties_base[] = {
     {"idle-active", mp_property_idle},
     {"window-id", mp_property_window_id},
     {"display-swapchain", mp_property_vo_display_swapchain},
+    {"external-surface-size", mp_property_external_surface_size},
+    {"external-surface-size-live", mp_property_external_surface_size},
 
     {"chapter-list", mp_property_list_chapters},
     {"track-list", mp_property_list_tracks},
@@ -8017,7 +8044,11 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
             queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
     }
 
-    if (opt_ptr == &opts->vo->android_surface_size || opt_ptr == &opts->vo->d3d11_composition_size) {
+    // The embedding property owns its synchronous resize. Preserve the
+    // option callback for the Android and D3D11 surfaces.
+    if ((opt_ptr == &opts->vo->android_surface_size &&
+         strcmp(co->name, "external-surface-size") != 0) ||
+        opt_ptr == &opts->vo->d3d11_composition_size) {
         if (mpctx->video_out)
             vo_control(mpctx->video_out, VOCTRL_EXTERNAL_RESIZE, NULL);
     }

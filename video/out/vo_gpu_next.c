@@ -1307,6 +1307,31 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current);
     apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
+    // During an embedded live resize the viewport changes at display cadence,
+    // but the drawable pool stays valid. Render in normalized viewport space;
+    // Core Animation maps that canvas to the current view without cropping it.
+    // This keeps letterboxing, zoom/pan, and OSD placement correct even when
+    // the view's aspect ratio changes, without retiring pending video frames.
+    if (strcmp(p->ra_ctx->fns->name, "moltenvk") == 0 &&
+        vo->dwidth > 1 && vo->dheight > 1)
+    {
+        float sx = (float)swframe.fbo->params.w / vo->dwidth;
+        float sy = (float)swframe.fbo->params.h / vo->dheight;
+        target.crop.x0 *= sx;
+        target.crop.x1 *= sx;
+        target.crop.y0 *= sy;
+        target.crop.y1 *= sy;
+        for (int n = 0; n < target.num_overlays; n++) {
+            struct pl_overlay *overlay = &p->osd_state.overlays[n];
+            struct pl_overlay_part *parts = (struct pl_overlay_part *)overlay->parts;
+            for (int i = 0; i < overlay->num_parts; i++) {
+                parts[i].dst.x0 *= sx;
+                parts[i].dst.x1 *= sx;
+                parts[i].dst.y0 *= sy;
+                parts[i].dst.y1 *= sy;
+            }
+        }
+    }
     update_tm_viz(&pars->color_map_params, &target);
 
     struct pl_frame_mix mix = {0};
@@ -1847,8 +1872,17 @@ static int control(struct vo *vo, uint32_t request, void *data)
         return true;
 
     case VOCTRL_EXTERNAL_RESIZE:
-        reconfig(vo, NULL);
-        return true;
+        if (data && *(bool *)data &&
+            strcmp(p->ra_ctx->fns->name, "moltenvk") == 0 &&
+            vo->opts->android_surface_size.w > 1 &&
+            vo->opts->android_surface_size.h > 1)
+        {
+            vo->dwidth = vo->opts->android_surface_size.w;
+            vo->dheight = vo->opts->android_surface_size.h;
+            resize(vo);
+            return VO_TRUE;
+        }
+        return reconfig(vo, NULL) >= 0 ? VO_TRUE : VO_FALSE;
 
     case VOCTRL_LOAD_HWDEC_API:
         ra_hwdec_ctx_load_fmt(&p->hwdec_ctx, vo->hwdec_devs, data);
