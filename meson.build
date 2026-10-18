@@ -835,7 +835,9 @@ vo_avfoundation = dependency('appleframeworks', modules: vo_avfoundation_framewo
 features += {'vo-avfoundation': vo_avfoundation.found()}
 if features['vo-avfoundation']
     dependencies += vo_avfoundation
-    sources += files('video/out/vo_avfoundation.m')
+    sources += files('video/out/vo_avfoundation.m', 'video/out/avfoundation_buffers.m',
+                     'video/out/avfoundation_hdr.m', 'video/out/avfoundation_osd.m',
+                     'video/out/avfoundation_subtitle_layer.m')
 endif
 
 coreaudio = dependency('appleframeworks', modules: ['CoreFoundation', 'CoreAudio',
