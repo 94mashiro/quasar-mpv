@@ -47,6 +47,7 @@ struct sd_ass_priv {
     struct ass_track *shadow_track; // for --sub-ass=no rendering
     bool ass_configured;
     bool is_converted;
+    bool is_webvtt;
     struct lavc_conv *converter;
     struct sd_filter **filters;
     int num_filters;
@@ -62,6 +63,15 @@ struct sd_ass_priv {
     int *packets_animated;
     int num_packets_animated;
     bool check_animated;
+    struct text_event_metadata *text_event_metadata;
+    int num_text_event_metadata;
+};
+
+struct text_event_metadata {
+    int read_order;
+    long long start;
+    long long end;
+    char *webvtt_settings;
 };
 
 struct seen_packet {
@@ -99,6 +109,87 @@ const struct m_sub_options mp_sub_filter_opts = {
 
 static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts);
 static void fill_plaintext(struct sd *sd, double pts);
+
+static void clear_text_event_metadata(struct sd_ass_priv *ctx)
+{
+    for (int n = 0; n < ctx->num_text_event_metadata; n++)
+        talloc_free(ctx->text_event_metadata[n].webvtt_settings);
+    TA_FREEP(&ctx->text_event_metadata);
+    ctx->num_text_event_metadata = 0;
+}
+
+static void add_text_event_metadata(struct sd_ass_priv *ctx, ASS_Event *event,
+                                    const char *webvtt_settings)
+{
+    struct text_event_metadata metadata = {
+        .read_order = event->ReadOrder,
+        .start = event->Start,
+        .end = event->Start + event->Duration,
+        .webvtt_settings = talloc_strdup(ctx, webvtt_settings),
+    };
+    MP_TARRAY_APPEND(ctx, ctx->text_event_metadata,
+                     ctx->num_text_event_metadata, metadata);
+}
+
+static const char *find_webvtt_settings(struct sd_ass_priv *ctx,
+                                        ASS_Event *event)
+{
+    for (int n = ctx->num_text_event_metadata - 1; n >= 0; n--) {
+        struct text_event_metadata *metadata = &ctx->text_event_metadata[n];
+        if (metadata->read_order == event->ReadOrder &&
+            metadata->start == event->Start)
+            return metadata->webvtt_settings;
+    }
+    // Empty settings still mean WebVTT placement.
+    return ctx->is_webvtt ? "" : NULL;
+}
+
+static void update_text_event_metadata_end(struct sd_ass_priv *ctx,
+                                           ASS_Event *event)
+{
+    for (int n = ctx->num_text_event_metadata - 1; n >= 0; n--) {
+        struct text_event_metadata *metadata = &ctx->text_event_metadata[n];
+        if (metadata->read_order == event->ReadOrder &&
+            metadata->start == event->Start)
+        {
+            metadata->end = event->Start + event->Duration;
+            return;
+        }
+    }
+}
+
+static void prune_text_event_metadata(struct sd_ass_priv *ctx,
+                                      long long deadline)
+{
+    int dst = 0;
+    for (int src = 0; src < ctx->num_text_event_metadata; src++) {
+        struct text_event_metadata metadata = ctx->text_event_metadata[src];
+        if (metadata.end <= deadline) {
+            talloc_free(metadata.webvtt_settings);
+            continue;
+        }
+        ctx->text_event_metadata[dst++] = metadata;
+    }
+    ctx->num_text_event_metadata = dst;
+
+    if (!dst) {
+        TA_FREEP(&ctx->text_event_metadata);
+    } else if (MP_TALLOC_AVAIL(ctx->text_event_metadata) > MPMAX(32, dst * 2)) {
+        MP_RESIZE_ARRAY(ctx, ctx->text_event_metadata, dst);
+    }
+}
+
+static bool get_prune_deadline(struct sd *sd, long long ts,
+                               long long *deadline)
+{
+#if LIBASS_VERSION >= 0x01703010
+    if (sd->opts->ass_prune_delay >= 0) {
+        *deadline = ts - llrint(sd->opts->ass_prune_delay * 1000.0);
+        return true;
+    }
+#endif
+    return false;
+}
 
 static const struct sd_filter_functions *const filters[] = {
     // Note: list order defines filter order.
@@ -294,6 +385,7 @@ static void assobjects_destroy(struct sd *sd)
 {
     struct sd_ass_priv *ctx = sd->priv;
 
+    clear_text_event_metadata(ctx);
     ass_free_track(ctx->ass_track);
     ass_free_track(ctx->shadow_track);
     enable_output(sd, false);
@@ -314,6 +406,7 @@ static int init(struct sd *sd)
         ctx->converter = lavc_conv_create(sd);
         if (!ctx->converter)
             return -1;
+        ctx->is_webvtt = lavc_conv_is_webvtt(ctx->converter);
     }
 
     assobjects_init(sd);
@@ -367,7 +460,8 @@ static bool is_animated(const char *str)
 }
 
 // Note: pkt is not necessarily a fully valid refcounted packet.
-static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
+static void filter_and_add(struct sd *sd, struct demux_packet *pkt,
+                           const char *webvtt_settings)
 {
     struct sd_ass_priv *ctx = sd->priv;
     struct demux_packet *orig_pkt = pkt;
@@ -387,6 +481,11 @@ static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
     ass_process_chunk(ctx->ass_track, pkt->buffer, pkt->len,
                       llrint(pkt->pts * 1000),
                       llrint(pkt->duration * 1000));
+
+    if (webvtt_settings) {
+        for (int n = old_n_events; n < track->n_events; n++)
+            add_text_event_metadata(ctx, &track->events[n], webvtt_settings);
+    }
 
     // This bookkeeping only has any practical use for ASS subs
     // over a VO with no video.
@@ -465,8 +564,9 @@ static void decode(struct sd *sd, struct demux_packet *packet)
 
         double sub_pts = 0;
         double sub_duration = 0;
+        const char *webvtt_settings = NULL;
         char **r = lavc_conv_decode(ctx->converter, packet, &sub_pts,
-                                    &sub_duration);
+                                    &sub_duration, &webvtt_settings);
         if (sd->opts->sub_stretch_durations ||
             packet->duration < 0 || sub_duration == UINT32_MAX) {
             MP_VERBOSE(sd, "Subtitle with unknown duration.\n");
@@ -480,7 +580,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
                 .buffer = r[n],
                 .len = strlen(r[n]),
             };
-            filter_and_add(sd, &pkt2);
+            filter_and_add(sd, &pkt2, webvtt_settings);
         }
         for (int n = track->n_events - 1; n >= 0; n--) {
             if (track->events[track->n_events - 1].Start == track->events[n].Start)
@@ -492,6 +592,8 @@ static void decode(struct sd *sd, struct demux_packet *packet)
                 } else if (track->events[n].Start == track->events[n + 1].Start) {
                     track->events[n].Duration = track->events[n + 1].Duration;
                 }
+                if (track->events[n].Duration != UNKNOWN_DURATION * 1000)
+                    update_text_event_metadata_end(ctx, &track->events[n]);
             }
             if (n > 0 && track->events[n].Start != track->events[n - 1].Start)
                 break;
@@ -501,7 +603,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
         // for discarding duplicate (already seen) packets but we check this
         // anyways for our purposes for ASS subtitles.
         packet->seen = check_packet_seen(sd, packet);
-        filter_and_add(sd, packet);
+        filter_and_add(sd, packet, NULL);
     }
 }
 
@@ -739,7 +841,24 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
     struct mp_osd_res old_osd = ctx->osd;
     ctx->osd = dim;
 
-    if (pts == MP_NOPTS_VALUE || !renderer)
+    if (pts == MP_NOPTS_VALUE)
+        goto done;
+
+    long long ts = find_timestamp(sd, pts);
+    long long prune_deadline = 0;
+    bool prune = get_prune_deadline(sd, ts, &prune_deadline);
+
+    if (opts->sub_text_intercept && ctx->is_converted) {
+#if LIBASS_VERSION >= 0x01703010
+        if (prune)
+            ass_prune_events(ctx->ass_track, prune_deadline);
+#endif
+        if (prune)
+            prune_text_event_metadata(ctx, prune_deadline);
+        goto done;
+    }
+
+    if (!renderer)
         goto done;
 
     // Currently no supported text sub formats support a distinction between forced
@@ -771,13 +890,17 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
     } else {
         ass_set_storage_size(renderer, 0, 0);
     }
-    long long ts = find_timestamp(sd, pts);
-
     if (no_ass)
         fill_plaintext(sd, pts);
 
     int changed;
     ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
+#if LIBASS_VERSION >= 0x01703010
+    if (prune && track != ctx->ass_track)
+        ass_prune_events(ctx->ass_track, prune_deadline);
+#endif
+    if (prune)
+        prune_text_event_metadata(ctx, prune_deadline);
     mp_ass_packer_pack(ctx->packer, &imgs, 1, changed, !converted, format, res);
 
 done:
@@ -920,6 +1043,42 @@ static char *get_text(struct sd *sd, double pts, enum sd_text_type type)
     return bstrto0(NULL, get_text_buf(sd, pts, type));
 }
 
+static void get_text_snapshot(struct sd *sd, double pts,
+                              struct sub_text_snapshot *snapshot)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    ASS_Track *track = ctx->ass_track;
+
+    if (!ctx->is_converted || pts == MP_NOPTS_VALUE ||
+        sd->opts->sub_forced_events_only)
+        return;
+
+    long long ipts = find_timestamp(sd, pts);
+
+    for (int n = 0; n < track->n_events; n++) {
+        ASS_Event *event = &track->events[n];
+        if (ipts < event->Start || ipts >= event->Start + event->Duration ||
+            !event->Text)
+            continue;
+
+        bstr text = {0};
+        ass_to_plaintext(&text, event->Text);
+        if (is_whitespace_only(text)) {
+            talloc_free(text.start);
+            continue;
+        }
+
+        const char *settings = find_webvtt_settings(ctx, event);
+        struct sub_text_region region = {
+            .text = bstrto0(snapshot, text),
+            .webvtt_settings = settings ? talloc_strdup(snapshot, settings) : NULL,
+        };
+        MP_TARRAY_APPEND(snapshot, snapshot->regions, snapshot->num_regions,
+                         region);
+        talloc_free(text.start);
+    }
+}
+
 static struct sd_times get_times(struct sd *sd, double pts)
 {
     struct sd_ass_priv *ctx = sd->priv;
@@ -996,6 +1155,7 @@ static void reset(struct sd *sd)
     struct sd_ass_priv *ctx = sd->priv;
     if (sd->opts->sub_clear_on_seek || ctx->clear_once) {
         ass_flush_events(ctx->ass_track);
+        clear_text_event_metadata(ctx);
         ctx->num_seen_packets = 0;
         sd->preload_ok = false;
         ctx->clear_once = false;
@@ -1065,6 +1225,7 @@ const struct sd_functions sd_ass = {
     .decode = decode,
     .get_bitmaps = get_bitmaps,
     .get_text = get_text,
+    .get_text_snapshot = get_text_snapshot,
     .get_times = get_times,
     .control = control,
     .reset = reset,

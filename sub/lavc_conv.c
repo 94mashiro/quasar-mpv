@@ -41,6 +41,8 @@ struct lavc_conv {
     char *extradata;
     AVSubtitle cur;
     char **cur_list;
+    bool is_webvtt;
+    char *webvtt_settings;
 };
 
 static const char *get_lavc_format(const char *format)
@@ -61,6 +63,8 @@ struct lavc_conv *lavc_conv_create(struct sd *sd)
     priv->opts = sd->opts;
     priv->cur_list = talloc_array(priv, char*, 0);
     priv->codec = sd->codec->codec;
+    priv->is_webvtt = strcmp(priv->codec, "webvtt") == 0 ||
+                          strcmp(priv->codec, "webvtt-webm") == 0;
     AVCodecContext *avctx = NULL;
     AVDictionary *opts = NULL;
     const char *fmt = get_lavc_format(priv->codec);
@@ -228,7 +232,8 @@ static int parse_webvtt(AVPacket *in, AVPacket *pkt)
 // the AVSubtitle display PTS and duration set to input
 // double variables.
 char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet,
-                        double *sub_pts, double *sub_duration)
+                        double *sub_pts, double *sub_duration,
+                        const char **webvtt_settings)
 {
     AVCodecContext *avctx = priv->avctx;
     AVPacket *curr_pkt = priv->avpkt;
@@ -236,6 +241,8 @@ char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet,
     int num_cur = 0;
 
     avsubtitle_free(&priv->cur);
+    TA_FREEP(&priv->webvtt_settings);
+    *webvtt_settings = NULL;
 
     mp_set_av_packet(priv->avpkt, packet, &avctx->time_base);
     if (priv->avpkt->pts < 0)
@@ -247,6 +254,16 @@ char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet,
             goto done;
         }
         curr_pkt = priv->avpkt_vtt;
+    }
+
+    if (priv->is_webvtt) {
+        size_t settings_size = 0;
+        uint8_t *settings = av_packet_get_side_data(
+            curr_pkt, AV_PKT_DATA_WEBVTT_SETTINGS, &settings_size);
+        priv->webvtt_settings = settings
+            ? talloc_strndup(priv, (char *)settings, settings_size)
+            : talloc_strdup(priv, "");
+        *webvtt_settings = priv->webvtt_settings;
     }
 
     priv->styled = avctx->codec_id == AV_CODEC_ID_DVB_TELETEXT;
@@ -295,6 +312,11 @@ done:
 bool lavc_conv_is_styled(struct lavc_conv *priv)
 {
     return priv->styled;
+}
+
+bool lavc_conv_is_webvtt(struct lavc_conv *priv)
+{
+    return priv->is_webvtt;
 }
 
 void lavc_conv_reset(struct lavc_conv *priv)

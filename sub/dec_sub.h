@@ -33,6 +33,18 @@ struct sd_times {
     double end;
 };
 
+struct sub_text_region {
+    char *text;
+    // NULL: automatic placement. Non-NULL, even empty: raw WebVTT cue
+    // settings.
+    char *webvtt_settings;
+};
+
+struct sub_text_snapshot {
+    struct sub_text_region *regions;
+    int num_regions;
+};
+
 struct attachment_list {
     struct demux_attachment *entries;
     int num_entries;
@@ -50,6 +62,8 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
 struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
                                     int format, double pts);
 char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
+struct sub_text_snapshot *sub_get_text_snapshot(struct dec_sub *sub,
+                                                void *ta_parent, double pts);
 char *sub_ass_get_extradata(struct dec_sub *sub);
 struct sd_times sub_get_times(struct dec_sub *sub, double pts);
 void sub_reset(struct dec_sub *sub);

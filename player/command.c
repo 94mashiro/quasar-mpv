@@ -3371,6 +3371,56 @@ static int mp_property_sub_text(void *ctx, struct m_property *prop,
     return M_PROPERTY_NOT_IMPLEMENTED;
 }
 
+static int mp_property_sub_text_snapshot(void *ctx, struct m_property *prop,
+                                         int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+
+    switch (action) {
+    case M_PROPERTY_GET_TYPE:
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    case M_PROPERTY_GET: {
+        struct mpv_node node;
+        node_init(&node, MPV_FORMAT_NODE_ARRAY, NULL);
+
+        double pts = mpctx->playback_pts;
+        if (pts != MP_NOPTS_VALUE) {
+            // Native cue order: primary, then secondary.
+            for (int order = 0; order < num_ptracks[STREAM_SUB]; order++) {
+                struct track *track = mpctx->current_track[order][STREAM_SUB];
+                struct dec_sub *sub = track ? track->d_sub : NULL;
+                if (!sub)
+                    continue;
+                if (order == 0 && !sub_is_primary_visible(sub))
+                    continue;
+                if (order == 1 && !sub_is_secondary_visible(sub))
+                    continue;
+
+                struct sub_text_snapshot *snapshot =
+                    sub_get_text_snapshot(sub, NULL, pts);
+                for (int n = 0; n < snapshot->num_regions; n++) {
+                    struct sub_text_region *region = &snapshot->regions[n];
+                    struct mpv_node *entry =
+                        node_array_add(&node, MPV_FORMAT_NODE_MAP);
+                    node_map_add_string(entry, "text", region->text);
+                    if (region->webvtt_settings) {
+                        node_map_add_string(entry, "format", "webvtt");
+                        node_map_add_string(entry, "settings",
+                                            region->webvtt_settings);
+                    }
+                }
+                talloc_free(snapshot);
+            }
+        }
+
+        *(struct mpv_node *)arg = node;
+        return M_PROPERTY_OK;
+    }
+    }
+    return M_PROPERTY_NOT_IMPLEMENTED;
+}
+
 static struct sd_times get_times(void *ctx, struct m_property *prop,
                                 int action, void *arg)
 {
@@ -4526,6 +4576,7 @@ static const struct m_property mp_properties_base[] = {
         .priv = (void *)&(const int[]){0, SD_TEXT_TYPE_PLAIN}},
     {"secondary-sub-text", mp_property_sub_text,
         .priv = (void *)&(const int[]){1, SD_TEXT_TYPE_PLAIN}},
+    {"sub-text-snapshot", mp_property_sub_text_snapshot},
     M_PROPERTY_DEPRECATED_ALIAS("sub-text-ass", "sub-text/ass"),
     {"sub-start", mp_property_sub_start,
         .priv = (void *)&(const int){0}},
@@ -4605,15 +4656,17 @@ static const char *const *const mp_event_property_change[] = {
     E(MPV_EVENT_END_FILE, "*"),
     E(MPV_EVENT_FILE_LOADED, "*"),
     E(MP_EVENT_CHANGE_ALL, "*"),
-    E(MP_EVENT_TRACKS_CHANGED, "track-list", "current-tracks"),
-    E(MP_EVENT_TRACK_SWITCHED, "track-list", "current-tracks"),
+    E(MP_EVENT_TRACKS_CHANGED, "track-list", "current-tracks",
+      "sub-text-snapshot"),
+    E(MP_EVENT_TRACK_SWITCHED, "track-list", "current-tracks",
+      "sub-text-snapshot"),
     E(MPV_EVENT_IDLE, "*"),
     E(MPV_EVENT_TICK, "time-pos", "audio-pts", "stream-pos", "avsync",
       "percent-pos", "time-remaining", "playtime-remaining", "playback-time",
       "estimated-vf-fps", "total-avsync-change", "audio-speed-correction",
       "video-speed-correction", "vo-delayed-frame-count", "mistimed-frame-count",
       "vsync-ratio", "estimated-display-fps", "vsync-jitter", "sub-text",
-      "secondary-sub-text", "audio-bitrate", "video-bitrate", "sub-bitrate",
+      "secondary-sub-text", "sub-text-snapshot", "audio-bitrate", "video-bitrate", "sub-bitrate",
       "decoder-frame-drop-count", "frame-drop-count", "video-frame-info",
       "vf-metadata", "af-metadata", "sub-start", "sub-end", "secondary-sub-start",
       "secondary-sub-end", "video-out-params", "video-dec-params", "video-params",

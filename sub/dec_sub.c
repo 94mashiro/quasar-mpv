@@ -447,6 +447,29 @@ char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type)
     return text;
 }
 
+struct sub_text_snapshot *sub_get_text_snapshot(struct dec_sub *sub,
+                                                void *ta_parent, double pts)
+{
+    struct sub_text_snapshot *snapshot =
+        talloc_zero(ta_parent, struct sub_text_snapshot);
+
+    mp_mutex_lock(&sub->lock);
+
+    pts = pts_to_subtitle(sub, pts);
+
+    sub->last_vo_pts = pts;
+    update_segment(sub);
+
+    if (!(sub->end != MP_NOPTS_VALUE && pts >= sub->end) &&
+        sub->sd->driver->get_text_snapshot)
+    {
+        sub->sd->driver->get_text_snapshot(sub->sd, pts, snapshot);
+    }
+
+    mp_mutex_unlock(&sub->lock);
+    return snapshot;
+}
+
 char *sub_ass_get_extradata(struct dec_sub *sub)
 {
     char *data = NULL;

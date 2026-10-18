@@ -300,6 +300,7 @@ const struct m_sub_options mp_subtitle_sub_opts = {
     .opts = (const struct m_option[]){
         {"sub-fps", OPT_FLOAT(sub_fps)},
         {"sub-speed", OPT_FLOAT(sub_speed)},
+        {"sub-text-intercept", OPT_BOOL(sub_text_intercept)},
         {"sub-forced-events-only", OPT_BOOL(sub_forced_events_only)},
         {"stretch-dvd-subs", OPT_BOOL(stretch_dvd_subs)},
         {"stretch-image-subs-to-screen", OPT_BOOL(stretch_image_subs)},

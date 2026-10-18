@@ -50,6 +50,8 @@ struct sd_functions {
     struct sub_bitmaps *(*get_bitmaps)(struct sd *sd, struct mp_osd_res dim,
                                        int format, double pts);
     char *(*get_text)(struct sd *sd, double pts, enum sd_text_type type);
+    void (*get_text_snapshot)(struct sd *sd, double pts,
+                              struct sub_text_snapshot *snapshot);
     struct sd_times (*get_times)(struct sd *sd, double pts);
 };
 
@@ -58,8 +60,10 @@ struct lavc_conv;
 struct lavc_conv *lavc_conv_create(struct sd *sd);
 char *lavc_conv_get_extradata(struct lavc_conv *priv);
 char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet,
-                        double *sub_pts, double *sub_duration);
+                        double *sub_pts, double *sub_duration,
+                        const char **webvtt_settings);
 bool lavc_conv_is_styled(struct lavc_conv *priv);
+bool lavc_conv_is_webvtt(struct lavc_conv *priv);
 void lavc_conv_reset(struct lavc_conv *priv);
 void lavc_conv_uninit(struct lavc_conv *priv);
 
