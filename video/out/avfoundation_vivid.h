@@ -1,7 +1,8 @@
 /* HDR Vivid (T/UWA 005.1-2022 chapter 9) PQ tone mapping for the native output.
  * Plain C so the host test compiles it without FFmpeg. The Metal kernel source
  * lives here too, next to the C reference it must match.
- * LGPL-2.1-or-later, like the native video output. */
+ * Copyright (c) 2026 Quasar authors
+ * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef MP_AVFOUNDATION_VIVID_H
 #define MP_AVFOUNDATION_VIVID_H
 

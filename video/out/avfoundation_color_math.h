@@ -1,4 +1,6 @@
-/* Native overlay math. SPDX-License-Identifier: LGPL-2.1-or-later */
+/* Native overlay math.
+ * Copyright (c) 2026 MPVUI contributors
+ * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef MP_AVFOUNDATION_COLOR_MATH_H
 #define MP_AVFOUNDATION_COLOR_MATH_H
 #include <math.h>

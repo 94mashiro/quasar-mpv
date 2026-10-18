@@ -1,7 +1,8 @@
 /* Dolby Vision Profile 7 FEL composition (ETSI GS CCM 001 5.4) for the native
  * output. Plain C so the host test compiles it without FFmpeg; the Metal
  * kernel source lives here next to the C reference it must match.
- * LGPL-2.1-or-later, like the native video output. */
+ * Copyright (c) 2026 Quasar authors
+ * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef MP_AVFOUNDATION_FEL_H
 #define MP_AVFOUNDATION_FEL_H
 

@@ -1,5 +1,6 @@
 /* Per-frame HDR10+ bridge. This header is also compiled by the sanitizer tests.
- * LGPL-2.1-or-later, like the native video output. */
+ * Copyright (c) 2026 MPVUI contributors
+ * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef MP_AVFOUNDATION_HDR10PLUS_H
 #define MP_AVFOUNDATION_HDR10PLUS_H
 

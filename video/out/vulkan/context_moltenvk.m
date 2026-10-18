@@ -13,6 +13,11 @@
  *
  * You should have received a copy of the GNU Lesser General Public
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Contains code from edde746/MPVKit at b8b922ec, whose repository license at
+ * that revision was LGPL-3.0, and changes by Quasar (2026). This file as a
+ * whole is distributed under the GNU LGPL version 3; see
+ * quasar/AVFOUNDATION_CREDITS.md.
  */
 
 #include <CoreGraphics/CoreGraphics.h>

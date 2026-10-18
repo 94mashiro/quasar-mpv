@@ -25,3 +25,12 @@ python3 quasar/refactor/vo_compile.py . ao
 `ao_plan.json` 是这次的分段和改名表。`ao_split.py` 只适用于拆分前的那份文件，留作记录；在已拆的树上重跑会覆盖源文件。
 
 `ao_avfoundation.m` 是上游文件。升级 mpv 时上游如果改了 `struct priv` 前几个字段、`@interface AVObserver` 或 `CMTimeGetNanoseconds`，冲突会落在拆分提交上，要把改动挪进 `ao_avfoundation_priv.h`。
+
+# 复查要在拆分提交上做
+
+拆分之后，文件头加了出处说明（见 `quasar/AVFOUNDATION_CREDITS.md`），所以在 main 上重跑 `verify.py`、`ao_verify.py` 会因为表头多出几行而报 FAIL。复查请在拆分提交上做：
+
+```sh
+git worktree add /tmp/split-check <拆分提交>
+python3 quasar/refactor/verify.py /tmp/vo_orig.m /tmp/split-check
+```

@@ -1,4 +1,6 @@
-/* CoreVideo metadata mapping. SPDX-License-Identifier: LGPL-2.1-or-later */
+/* CoreVideo metadata mapping.
+ * Copyright (c) 2026 MPVUI contributors
+ * SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef MP_AVFOUNDATION_COLOR_H
 #define MP_AVFOUNDATION_COLOR_H
 #import <Foundation/Foundation.h>
