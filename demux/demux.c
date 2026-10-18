@@ -2113,6 +2113,14 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
 
     // Possibly update duration based on highest TS demuxed (but ignore subs).
     if (stream->type != STREAM_SUB) {
+        // FFmpeg's animated WebP demuxer supplies per-frame durations but no
+        // stream duration. Include the final frame's display interval instead
+        // of reporting only its starting timestamp as the animation length.
+        if (stream->type == STREAM_VIDEO &&
+            strcmp(stream->codec->codec, "webp_anim") == 0 &&
+            ts != MP_NOPTS_VALUE && dp->duration > 0 &&
+            isfinite(dp->duration) && isfinite(ts + dp->duration))
+            ts += dp->duration;
         if (dp->segmented)
             ts = MP_PTS_MIN(ts, dp->end);
         if (ts > in->highest_av_pts) {
