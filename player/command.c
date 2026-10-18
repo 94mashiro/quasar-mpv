@@ -3448,6 +3448,9 @@ static int mp_property_sub_text_snapshot(void *ctx, struct m_property *prop,
                     struct mpv_node *entry =
                         node_array_add(&node, MPV_FORMAT_NODE_MAP);
                     node_map_add_string(entry, "text", region->text);
+                    node_map_add_int64(entry, "track-id", track->user_tid);
+                    node_map_add_string(entry, "role",
+                                        order == 0 ? "primary" : "secondary");
                     if (region->webvtt_settings) {
                         node_map_add_string(entry, "format", "webvtt");
                         node_map_add_string(entry, "settings",
@@ -6502,6 +6505,7 @@ static void cmd_sub_text_cues(void *p)
         node_map_add_double(entry, "start", cue->start);
         node_map_add_double(entry, "end", cue->end);
         node_map_add_string(entry, "text", cue->text);
+        node_map_add_int64(entry, "track-id", cmd->args[0].v.i);
         if (cue->webvtt_settings) {
             node_map_add_string(entry, "format", "webvtt");
             node_map_add_string(entry, "settings", cue->webvtt_settings);
