@@ -34,6 +34,7 @@
 #include "video/mp_image.h"
 #include "video/hwdec.h"
 #include "sub/osd.h"
+#include "avfoundation_color.h"
 
 #import <CoreMedia/CoreMedia.h>
 #import <AVFoundation/AVFoundation.h>
@@ -79,6 +80,7 @@ struct avfoundation_opts {
     int queue_lead_ms;
     int presentation;
     int osd_max_height;
+    double subtitle_luminance;
     bool osd_video_res;
 };
 
@@ -338,6 +340,7 @@ struct priv {
     // Cache format description; rebuild when dimensions, format, or
     // attachments change.
     CMVideoFormatDescriptionRef video_format_desc;
+    CFDictionaryRef video_format_attachments;
 
     // Maintenance frame counter.
     int frame_count;
@@ -1017,6 +1020,7 @@ static void update_avfoundation_options(struct vo *vo)
     int old_queue_lead_ms = p->opts->queue_lead_ms;
     int old_osd_max_height = p->opts->osd_max_height;
     bool old_osd_video_res = p->opts->osd_video_res;
+    double old_subtitle_luminance = p->opts->subtitle_luminance;
 
     if (!m_config_cache_update(p->opts_cache))
         return;
@@ -1030,8 +1034,10 @@ static void update_avfoundation_options(struct vo *vo)
     bool osd_scale_changed = old_osd_max_height != p->opts->osd_max_height ||
         old_osd_video_res != p->opts->osd_video_res;
 
-    if (!composite_changed && !osd_scale_changed)
+    bool luminance_changed = old_subtitle_luminance != p->opts->subtitle_luminance;
+    if (!composite_changed && !osd_scale_changed && !luminance_changed)
         return;
+    if (luminance_changed) vo->want_redraw = true;
 
     if (composite_changed) {
         MP_VERBOSE(vo, "OSD compositing updated: composite_osd: %s, "
@@ -1250,9 +1256,14 @@ static bool create_pixel_buffer_pool(struct vo *vo, CVPixelBufferPoolRef *poolRe
 }
 
 
-static OSType ci_output_format_for_source(OSType format)
+static OSType ci_output_format_for_source(CVPixelBufferRef buffer)
 {
-    if (format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+    OSType format = CVPixelBufferGetPixelFormatType(buffer);
+    CFTypeRef transfer = CVBufferGetAttachment(buffer, kCVImageBufferTransferFunctionKey, NULL);
+    bool hdr = transfer && (CFEqual(transfer, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ) ||
+                            CFEqual(transfer, kCVImageBufferTransferFunction_ITU_R_2100_HLG));
+    if (hdr || format == kCVPixelFormatType_64RGBAHalf ||
+        format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
         format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
         return kCVPixelFormatType_64RGBAHalf;
     return kCVPixelFormatType_32BGRA;
@@ -1267,88 +1278,14 @@ static bool create_output_pool(struct vo *vo, int w, int h, OSType outputFormat)
         "composite output");
 }
 
-static CFStringRef get_cv_color_primaries(enum pl_color_primaries primaries)
-{
-    switch (primaries) {
-    case PL_COLOR_PRIM_BT_709:
-        return kCVImageBufferColorPrimaries_ITU_R_709_2;
-    case PL_COLOR_PRIM_BT_2020:
-        return kCVImageBufferColorPrimaries_ITU_R_2020;
-    default:
-        return NULL;
-    }
-}
-
-static CFStringRef get_cv_transfer_function(enum pl_color_transfer transfer)
-{
-    switch (transfer) {
-    case PL_COLOR_TRC_SRGB:
-        return kCVImageBufferTransferFunction_sRGB;
-    case PL_COLOR_TRC_BT_1886:
-        return kCVImageBufferTransferFunction_ITU_R_709_2;
-    case PL_COLOR_TRC_PQ:
-        return kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ;
-    case PL_COLOR_TRC_HLG:
-        return kCVImageBufferTransferFunction_ITU_R_2100_HLG;
-    default:
-        return NULL;
-    }
-}
-
-static CFStringRef get_cv_ycbcr_matrix(enum pl_color_system sys)
-{
-    switch (sys) {
-    case PL_COLOR_SYSTEM_BT_601:
-        return kCVImageBufferYCbCrMatrix_ITU_R_601_4;
-    case PL_COLOR_SYSTEM_BT_709:
-        return kCVImageBufferYCbCrMatrix_ITU_R_709_2;
-    case PL_COLOR_SYSTEM_BT_2020_NC:
-    case PL_COLOR_SYSTEM_BT_2020_C:
-    case PL_COLOR_SYSTEM_BT_2100_PQ:
-    case PL_COLOR_SYSTEM_BT_2100_HLG:
-        return kCVImageBufferYCbCrMatrix_ITU_R_2020;
-    default:
-        return NULL;
-    }
-}
-
-static void set_colorspace_from_attachments(CVPixelBufferRef pixbuf)
-{
-    CFDictionaryRef attachments = CVBufferGetAttachments(
-        pixbuf, kCVAttachmentMode_ShouldPropagate);
-    if (!attachments)
-        return;
-
-    CGColorSpaceRef colorspace = CVImageBufferCreateColorSpaceFromAttachments(attachments);
-    if (!colorspace)
-        return;
-
-    CVBufferSetAttachment(pixbuf, kCVImageBufferCGColorSpaceKey, colorspace,
-                          kCVAttachmentMode_ShouldPropagate);
-    CGColorSpaceRelease(colorspace);
-}
-
 static void tag_pixel_buffer_color_metadata(CVPixelBufferRef pixbuf,
                                             const struct mp_image_params *params)
 {
-    CFStringRef primaries = get_cv_color_primaries(params->color.primaries);
-    CFStringRef transfer = get_cv_transfer_function(params->color.transfer);
-    CFStringRef matrix = get_cv_ycbcr_matrix(params->repr.sys);
-
-    if (primaries) {
-        CVBufferSetAttachment(pixbuf, kCVImageBufferColorPrimariesKey,
-                              primaries, kCVAttachmentMode_ShouldPropagate);
-    }
-    if (transfer) {
-        CVBufferSetAttachment(pixbuf, kCVImageBufferTransferFunctionKey,
-                              transfer, kCVAttachmentMode_ShouldPropagate);
-    }
-    if (matrix) {
-        CVBufferSetAttachment(pixbuf, kCVImageBufferYCbCrMatrixKey,
-                              matrix, kCVAttachmentMode_ShouldPropagate);
-    }
-    if (primaries || transfer || matrix)
-        set_colorspace_from_attachments(pixbuf);
+    avf_tag_color_metadata(pixbuf, &params->color, params->repr.sys, params->chroma_location);
+    avf_tag_geometry(pixbuf, params->p_w, params->p_h,
+                     params->crop.x0, params->crop.y0, params->crop.x1, params->crop.y1);
+    // Rotation/vertical flip are consumed by mpv's autorotate filter before
+    // this VO (which deliberately does not advertise VO_CAP_ROTATE90).
 }
 
 static void restore_dolby_vision_transfer(CVPixelBufferRef pixbuf,
@@ -1380,7 +1317,8 @@ static void tag_pixel_buffer_pixel_aspect(struct vo *vo, CVPixelBufferRef pixbuf
     // Only coded-size passthrough, upload, and frame-space composites carry
     // source sample aspect. Display-shaped, vo_get_src_dst_rects-letterboxed
     // buffers already have square pixels; avoid double correction.
-    bool coded_size = bw == (size_t)vo->params->w && bh == (size_t)vo->params->h;
+    bool coded_size = bw == (size_t)vo->params->w && bh == (size_t)vo->params->h &&
+                      is_biplanar_yuv_format(CVPixelBufferGetPixelFormatType(pixbuf));
 
     if (coded_size && p_w > 0 && p_h > 0 && p_w != p_h) {
         NSDictionary *par = @{
@@ -1394,51 +1332,6 @@ static void tag_pixel_buffer_pixel_aspect(struct vo *vo, CVPixelBufferRef pixbuf
         // Square pixels or recycled buffer: remove stale attachment.
         CVBufferRemoveAttachment(pixbuf, kCVImageBufferPixelAspectRatioKey);
     }
-}
-
-static void copy_pixel_buffer_attachment(CVBufferRef src, CVBufferRef dst,
-                                         CFStringRef key)
-{
-    CVAttachmentMode mode = kCVAttachmentMode_ShouldPropagate;
-    CFTypeRef value = CVBufferGetAttachment(src, key, &mode);
-    if (value) {
-        CVBufferSetAttachment(dst, key, value, mode);
-    } else {
-        CVBufferRemoveAttachment(dst, key);
-    }
-}
-
-static void copy_pixel_buffer_metadata(CVPixelBufferRef src, CVPixelBufferRef dst,
-                                       OSType dst_format)
-{
-    CVBufferPropagateAttachments(src, dst);
-
-    const CFStringRef keys[] = {
-        kCVImageBufferCGColorSpaceKey,
-        kCVImageBufferICCProfileKey,
-        kCVImageBufferGammaLevelKey,
-        kCVImageBufferColorPrimariesKey,
-        kCVImageBufferTransferFunctionKey,
-        kCVImageBufferYCbCrMatrixKey,
-        kCVImageBufferMasteringDisplayColorVolumeKey,
-        kCVImageBufferContentLightLevelInfoKey,
-        kCVImageBufferChromaLocationTopFieldKey,
-        kCVImageBufferChromaLocationBottomFieldKey,
-        kCVImageBufferChromaSubsamplingKey,
-        kCVImageBufferCleanApertureKey,
-        kCVImageBufferPreferredCleanApertureKey,
-        kCVImageBufferPixelAspectRatioKey,
-    };
-
-    for (int i = 0; i < MP_ARRAY_SIZE(keys); i++)
-        copy_pixel_buffer_attachment(src, dst, keys[i]);
-
-    if (!is_biplanar_yuv_format(dst_format))
-        CVBufferRemoveAttachment(dst, kCVImageBufferYCbCrMatrixKey);
-
-    if (!CVBufferGetAttachment(dst, kCVImageBufferCGColorSpaceKey, NULL) &&
-        !is_biplanar_yuv_format(dst_format))
-        set_colorspace_from_attachments(dst);
 }
 
 static void get_yuv_coefficients(CVPixelBufferRef pixbuf, double *kr, double *kb)
@@ -1456,6 +1349,9 @@ static void get_yuv_coefficients(CVPixelBufferRef pixbuf, double *kr, double *kb
     } else if (CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4)) {
         *kr = 0.299;
         *kb = 0.114;
+    } else if (CFEqual(matrix, kCVImageBufferYCbCrMatrix_SMPTE_240M_1995)) {
+        *kr = 0.212;
+        *kb = 0.087;
     }
 }
 
@@ -1761,6 +1657,14 @@ static CVPixelBufferRef upload_software_frame(struct vo *vo, struct mp_image *mp
 {
     struct priv *p = vo->priv;
 
+    // CoreVideo has no equivalent tag for BT.2020 CL or ICtCp. Refuse an
+    // upload that would silently mislabel their samples as ordinary YCbCr.
+    if (!get_cv_ycbcr_matrix(mpi->params.repr.sys) ||
+        !get_cv_color_primaries(mpi->params.color.primaries) ||
+        !get_cv_transfer_function(mpi->params.color.transfer)) {
+        MP_ERR(vo, "MPVUI_NATIVE_VIDEO_UNSUPPORTED: software color signal cannot be represented by CoreVideo metadata\n");
+        return NULL;
+    }
     OSType cvFormat = get_cv_pixel_format(mpi->imgfmt);
     if (mpi->params.repr.levels == PL_COLOR_LEVELS_FULL) {
         if (is_nv12_format(cvFormat))
@@ -1857,7 +1761,7 @@ static void draw_subtitle_bitmaps(CGContextRef context, struct sub_bitmaps *imgs
                                   int h)
 {
     CGColorSpaceRef partColorSpace = (imgs->format == SUBBITMAP_BGRA)
-        ? CGColorSpaceCreateDeviceRGB() : NULL;
+        ? CGColorSpaceCreateWithName(kCGColorSpaceSRGB) : NULL;
 
     for (int i = 0; i < imgs->num_parts; i++) {
         struct sub_bitmap *sb = &imgs->parts[i];
@@ -2232,7 +2136,7 @@ static CGImageRef render_subtitle_image(struct vo *vo, struct sub_bitmaps *imgs)
     if (w <= 0 || h <= 0)
         return NULL;
 
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     if (!colorSpace)
         return NULL;
 
@@ -2337,7 +2241,7 @@ static CVPixelBufferRef render_subtitle_pixel_buffer(struct vo *vo,
         return pixbuf;
     }
 
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     CGContextRef context = colorSpace ? CGBitmapContextCreate(
         base, w, h, 8, stride, colorSpace,
         kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
@@ -2471,7 +2375,7 @@ static bool render_osd_with_geometry(struct vo *vo, double pts,
     }
     void *base = CVPixelBufferGetBaseAddress(buf);
     size_t stride = CVPixelBufferGetBytesPerRow(buf);
-    CGColorSpaceRef color = CGColorSpaceCreateDeviceRGB();
+    CGColorSpaceRef color = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     CGContextRef cg = base && color ? CGBitmapContextCreate(
         base, p->osd_w, p->osd_h, 8, stride, color,
         kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little) : NULL;
@@ -2538,11 +2442,14 @@ static bool ensure_ci_compositor(struct vo *vo)
         return false;
     }
 
+    CGColorSpaceRef workingSpace = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearITUR_2020);
     NSDictionary *ciOptions = @{
         kCIContextHighQualityDownsample: @NO,
-        kCIContextUseSoftwareRenderer: @NO
+        kCIContextUseSoftwareRenderer: @NO,
+        kCIContextWorkingColorSpace: (__bridge id)workingSpace
     };
     p->ciContext = [[CIContext contextWithMTLDevice:p->mtlDevice options:ciOptions] retain];
+    CGColorSpaceRelease(workingSpace);
     if (!p->ciContext) {
         MP_ERR(vo, "Failed to create CIContext\n");
         [p->mtlDevice release];
@@ -2559,6 +2466,56 @@ static void release_ci_compositor(struct priv *p)
     p->ciContext = nil;
     [p->mtlDevice release];
     p->mtlDevice = nil;
+}
+
+static struct avf_overlay_color get_overlay_color(struct vo *vo, CVPixelBufferRef videoBuffer)
+{
+    struct priv *p = vo->priv;
+    struct avf_overlay_color color = {
+        .white_nits = p->opts->subtitle_luminance,
+        .transfer = AVF_BT1886,
+    };
+    get_yuv_coefficients(videoBuffer, &color.kr, &color.kb);
+    CFTypeRef trc = CVBufferGetAttachment(videoBuffer, kCVImageBufferTransferFunctionKey, NULL);
+    if (trc) {
+        if (CFEqual(trc, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ)) color.transfer = AVF_PQ;
+        else if (CFEqual(trc, kCVImageBufferTransferFunction_ITU_R_2100_HLG)) color.transfer = AVF_HLG;
+        else if (CFEqual(trc, kCVImageBufferTransferFunction_sRGB)) color.transfer = AVF_SRGB;
+        else if (CFEqual(trc, kCVImageBufferTransferFunction_Linear)) color.transfer = AVF_LINEAR;
+    }
+    enum pl_color_primaries prim = vo->params->color.primaries;
+    CFTypeRef cvprim = CVBufferGetAttachment(videoBuffer, kCVImageBufferColorPrimariesKey, NULL);
+    const enum pl_color_primaries candidates[] = {
+        PL_COLOR_PRIM_BT_601_525, PL_COLOR_PRIM_BT_601_625, PL_COLOR_PRIM_BT_709,
+        PL_COLOR_PRIM_BT_2020, PL_COLOR_PRIM_DCI_P3, PL_COLOR_PRIM_DISPLAY_P3,
+    };
+    for (int i = 0; cvprim && i < MP_ARRAY_SIZE(candidates); i++)
+        if (CFEqual(cvprim, get_cv_color_primaries(candidates[i]))) prim = candidates[i];
+    if (prim == PL_COLOR_PRIM_UNKNOWN) prim = PL_COLOR_PRIM_BT_709;
+    pl_matrix3x3 matrix = pl_get_color_mapping_matrix(
+        pl_raw_primaries_get(PL_COLOR_PRIM_BT_709), pl_raw_primaries_get(prim),
+        PL_INTENT_RELATIVE_COLORIMETRIC);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) color.rgb_matrix[i][j] = matrix.m[i][j];
+
+    return color;
+}
+
+// An explicit output-transfer float texture makes PQ/HLG subtitle reference
+// white unambiguous. CI decodes it into the context's linear working space
+// before alpha composition; artwork alpha remains premultiplied at its input.
+static CIImage *subtitle_ci_image(struct vo *vo, CVPixelBufferRef videoBuffer)
+{
+    struct priv *p = vo->priv;
+    CVPixelBufferRef sub = p->cachedSubtitleBuffer;
+    if (!sub) return nil;
+    CGColorSpaceRef cs = CVImageBufferGetColorSpace(videoBuffer);
+    if (!cs) {
+        MP_ERR(vo, "MPVUI_NATIVE_VIDEO_UNSUPPORTED: no color space for native CI overlay\n");
+        return nil;
+    }
+    struct avf_overlay_color color = get_overlay_color(vo, videoBuffer);
+    return avf_subtitle_image(sub, cs, &color);
 }
 
 static CVPixelBufferRef composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
@@ -2644,73 +2601,58 @@ static CVPixelBufferRef composite_yuv_frame(struct vo *vo, CVPixelBufferRef vide
         return NULL;
     }
 
-    double kr, kb;
-    get_yuv_coefficients(videoBuffer, &kr, &kb);
-    double kg = 1.0 - kr - kb;
+    struct avf_overlay_color color = get_overlay_color(vo, videoBuffer);
+
     bool fullRange = is_full_range_yuv_format(sourceFormat);
     bool p010 = is_p010_format(sourceFormat);
-
     double yOffset = fullRange ? 0.0 : (p010 ? 64.0 : 16.0);
     double yRange = fullRange ? (p010 ? 1023.0 : 255.0) : (p010 ? 876.0 : 219.0);
     double cCenter = p010 ? 512.0 : 128.0;
     double cRange = fullRange ? (p010 ? 1023.0 : 255.0) : (p010 ? 896.0 : 224.0);
 
-    for (int y = vy0; y < vy1; y++) {
-        int sy = MPCLAMP(dst.y0 + (int)(((int64_t)(y - src.y0) * dstH) / srcH), 0, subH - 1);
-        uint8_t *subRow = subBase + (size_t)sy * subStride;
-        if (p010) {
-            uint16_t *yRow = (uint16_t *)(yBase + (size_t)y * yStride);
-            uint16_t *uvRow = (uint16_t *)(uvBase + (size_t)(y / 2) * uvStride);
-            for (int x = vx0; x < vx1; x++) {
-                int sx = MPCLAMP(dst.x0 + (int)(((int64_t)(x - src.x0) * dstW) / srcW), 0, subW - 1);
-                uint8_t *sp = subRow + (size_t)sx * 4;
-                double alpha = sp[3] / 255.0;
-                if (alpha <= 0.0)
-                    continue;
-
-                double b = sp[0] / 255.0;
-                double g = sp[1] / 255.0;
-                double r = sp[2] / 255.0;
-                double py = kr * r + kg * g + kb * b;
-                double oldY = yRow[x] >> 6;
-                yRow[x] = (uint16_t)(clip_u10(oldY * (1.0 - alpha) + yOffset * alpha + yRange * py) << 6);
-
-                if ((x & 1) == 0 && (y & 1) == 0) {
-                    double pu = (b - py) / (2.0 * (1.0 - kb));
-                    double pv = (r - py) / (2.0 * (1.0 - kr));
-                    int uvx = (x / 2) * 2;
-                    double oldU = uvRow[uvx] >> 6;
-                    double oldV = uvRow[uvx + 1] >> 6;
-                    uvRow[uvx] = (uint16_t)(clip_u10(oldU * (1.0 - alpha) + cCenter * alpha + cRange * pu) << 6);
-                    uvRow[uvx + 1] = (uint16_t)(clip_u10(oldV * (1.0 - alpha) + cCenter * alpha + cRange * pv) << 6);
+    for (int cy = vy0 / 2; cy < (vy1 + 1) / 2; cy++) {
+        uint8_t *uvRow = uvBase + (size_t)cy * uvStride;
+        for (int cx = vx0 / 2; cx < (vx1 + 1) / 2; cx++) {
+            double uv[2];
+            for (int k = 0; k < 2; k++) {
+                double code = p010 ? ((uint16_t *)uvRow)[2 * cx + k] >> 6 : uvRow[2 * cx + k];
+                uv[k] = (code - cCenter) / cRange;
+            }
+            uint8_t bgra[4][4] = {{0}};
+            double luma[4];
+            int xs[4], ys[4], count = 0;
+            for (int dy = 0; dy < 2 && cy * 2 + dy < videoH; dy++) {
+                int y = cy * 2 + dy;
+                uint8_t *yRow = yBase + (size_t)y * yStride;
+                for (int dx = 0; dx < 2 && cx * 2 + dx < videoW; dx++) {
+                    int x = cx * 2 + dx, i = count++;
+                    xs[i] = x; ys[i] = y;
+                    double code = p010 ? ((uint16_t *)yRow)[x] >> 6 : yRow[x];
+                    luma[i] = (code - yOffset) / yRange;
+                    if (x < vx0 || x >= vx1 || y < vy0 || y >= vy1) continue;
+                    int sx = MPCLAMP(dst.x0 + (int)(((int64_t)(x - src.x0) * dstW) / srcW), 0, subW - 1);
+                    int sy = MPCLAMP(dst.y0 + (int)(((int64_t)(y - src.y0) * dstH) / srcH), 0, subH - 1);
+                    memcpy(bgra[i], subBase + (size_t)sy * subStride + (size_t)sx * 4, 4);
                 }
             }
-        } else {
-            uint8_t *yRow = yBase + (size_t)y * yStride;
-            uint8_t *uvRow = uvBase + (size_t)(y / 2) * uvStride;
-            for (int x = vx0; x < vx1; x++) {
-                int sx = MPCLAMP(dst.x0 + (int)(((int64_t)(x - src.x0) * dstW) / srcW), 0, subW - 1);
-                uint8_t *sp = subRow + (size_t)sx * 4;
-                double alpha = sp[3] / 255.0;
-                if (alpha <= 0.0)
-                    continue;
-
-                double b = sp[0] / 255.0;
-                double g = sp[1] / 255.0;
-                double r = sp[2] / 255.0;
-                double py = kr * r + kg * g + kb * b;
-                yRow[x] = (uint8_t)clip_u8(yRow[x] * (1.0 - alpha) + yOffset * alpha + yRange * py);
-
-                if ((x & 1) == 0 && (y & 1) == 0) {
-                    double pu = (b - py) / (2.0 * (1.0 - kb));
-                    double pv = (r - py) / (2.0 * (1.0 - kr));
-                    int uvx = (x / 2) * 2;
-                    uvRow[uvx] = (uint8_t)clip_u8(uvRow[uvx] * (1.0 - alpha) + cCenter * alpha + cRange * pu);
-                    uvRow[uvx + 1] = (uint8_t)clip_u8(uvRow[uvx + 1] * (1.0 - alpha) + cCenter * alpha + cRange * pv);
-                }
+            if (!avf_blend_chroma_cell(&color, bgra, luma, uv, count)) continue;
+            for (int i = 0; i < count; i++) {
+                if (!bgra[i][3]) continue; // bit-exact untouched luma, including P010 low bits
+                uint8_t *yRow = yBase + (size_t)ys[i] * yStride;
+                double code = yOffset + yRange * luma[i];
+                if (p010) ((uint16_t *)yRow)[xs[i]] = clip_u10(code) << 6;
+                else yRow[xs[i]] = clip_u8(code);
+            }
+            for (int k = 0; k < 2; k++) {
+                double code = cCenter + cRange * uv[k];
+                if (p010) ((uint16_t *)uvRow)[2 * cx + k] = clip_u10(code) << 6;
+                else uvRow[2 * cx + k] = clip_u8(code);
             }
         }
     }
+    // Per-frame content statistics no longer describe pixels after overlays.
+    CVBufferRemoveAttachment(outputBuffer, kCVImageBufferContentLightLevelInfoKey);
+    CVBufferRemoveAttachment(outputBuffer, CFSTR("HDR10PlusPerFrameData"));
 
     CVPixelBufferUnlockBaseAddress(p->cachedSubtitleBuffer, kCVPixelBufferLock_ReadOnly);
     CVPixelBufferUnlockBaseAddress(outputBuffer, 0);
@@ -2740,8 +2682,7 @@ static CVPixelBufferRef render_video_geometry_frame(struct vo *vo,
     if (src.x1 <= src.x0 || src.y1 <= src.y0 || dst.x1 <= dst.x0 || dst.y1 <= dst.y0)
         return NULL;
 
-    OSType sourceFormat = CVPixelBufferGetPixelFormatType(videoBuffer);
-    OSType outputFormat = ci_output_format_for_source(sourceFormat);
+    OSType outputFormat = ci_output_format_for_source(videoBuffer);
     if (!create_output_pool(vo, (int)outW, (int)outH, outputFormat))
         return NULL;
 
@@ -2799,8 +2740,8 @@ static CVPixelBufferRef render_video_geometry_frame(struct vo *vo,
             [CIColor colorWithRed:0 green:0 blue:0 alpha:1]] imageByCroppingToRect:CGRectMake(0, 0, outW, outH)];
         CIImage *outputImage = [videoImage imageByCompositingOverImage:background];
 
-        if (include_subtitle && p->cachedSubtitleImage) {
-            CIImage *subtitleImage = [CIImage imageWithCGImage:p->cachedSubtitleImage];
+        if (include_subtitle && p->cachedSubtitleBuffer) {
+            CIImage *subtitleImage = subtitle_ci_image(vo, videoBuffer);
             if (subtitleImage) {
                 CGSize subSize = subtitleImage.extent.size;
                 if (subSize.width != (CGFloat)outW || subSize.height != (CGFloat)outH) {
@@ -2827,6 +2768,10 @@ static CVPixelBufferRef render_video_geometry_frame(struct vo *vo,
         }
     }
 
+    if (include_subtitle) {
+        CVBufferRemoveAttachment(outputBuffer, kCVImageBufferContentLightLevelInfoKey);
+        CVBufferRemoveAttachment(outputBuffer, CFSTR("HDR10PlusPerFrameData"));
+    }
     return outputBuffer;
 }
 
@@ -2852,7 +2797,7 @@ static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuf
             return composited;
     }
 
-    if (!p->cachedSubtitleImage || !ensure_ci_compositor(vo))
+    if (!p->cachedSubtitleBuffer || !ensure_ci_compositor(vo))
         return NULL;
 
     size_t videoW = CVPixelBufferGetWidth(videoBuffer);
@@ -2871,7 +2816,7 @@ static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuf
 
     CGRect outputRect = CGRectMake(0, 0, outW, outH);
 
-    OSType outputFormat = ci_output_format_for_source(sourceFormat);
+    OSType outputFormat = ci_output_format_for_source(videoBuffer);
 
     // Match output pool dimensions/format.
     if (!create_output_pool(vo, (int)outW, (int)outH, outputFormat))
@@ -2934,7 +2879,7 @@ static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuf
             [CIColor colorWithRed:0 green:0 blue:0 alpha:1]] imageByCroppingToRect:outputRect];
         videoImage = [videoImage imageByCompositingOverImage:background];
 
-        CIImage *subtitleImage = [CIImage imageWithCGImage:p->cachedSubtitleImage];
+        CIImage *subtitleImage = subtitle_ci_image(vo, videoBuffer);
 
         if (!subtitleImage) {
             CVPixelBufferRelease(outputBuffer);
@@ -2966,6 +2911,8 @@ static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuf
         }
     }
 
+    CVBufferRemoveAttachment(outputBuffer, kCVImageBufferContentLightLevelInfoKey);
+    CVBufferRemoveAttachment(outputBuffer, CFSTR("HDR10PlusPerFrameData"));
     return outputBuffer;
 }
 
@@ -3113,7 +3060,12 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
             applyGeometry = false;
         }
         if (applyGeometry) {
-            CVPixelBufferRef rendered = render_video_geometry_frame(vo, pixbuf, p->has_subtitle);
+            CVPixelBufferRef overlay = NULL;
+            if (p->has_subtitle && is_biplanar_yuv_format(CVPixelBufferGetPixelFormatType(pixbuf)))
+                overlay = composite_yuv_frame(vo, pixbuf, CVPixelBufferGetPixelFormatType(pixbuf), false);
+            CVPixelBufferRef rendered = render_video_geometry_frame(vo, overlay ?: pixbuf,
+                                                                    !overlay && p->has_subtitle);
+            if (overlay) CVPixelBufferRelease(overlay);
             if (rendered) {
                 if (!p->applied_geometry_last_frame) {
                     struct mp_vo_opts *opts = vo->opts;
@@ -3193,7 +3145,10 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
         // format, and attachments. Reconfig, geometry/compositing, or color
         // changes invalidate it.
         CMVideoFormatDescriptionRef format = p->video_format_desc;
-        if (!format || !CMVideoFormatDescriptionMatchesImageBuffer(format, finalBuffer)) {
+        CFDictionaryRef attachments = CVBufferGetAttachments(finalBuffer, kCVAttachmentMode_ShouldPropagate);
+        bool metadata_equal = attachments == p->video_format_attachments ||
+            (attachments && p->video_format_attachments && CFEqual(attachments, p->video_format_attachments));
+        if (!format || !metadata_equal || !CMVideoFormatDescriptionMatchesImageBuffer(format, finalBuffer)) {
             CMVideoFormatDescriptionRef new_format = NULL;
             OSStatus desc_err = CMVideoFormatDescriptionCreateForImageBuffer(
                 NULL, finalBuffer, &new_format);
@@ -3208,6 +3163,8 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
             if (p->video_format_desc)
                 CFRelease(p->video_format_desc);
             p->video_format_desc = new_format;
+            if (p->video_format_attachments) CFRelease(p->video_format_attachments);
+            p->video_format_attachments = attachments ? CFDictionaryCreateCopy(NULL, attachments) : NULL;
             format = new_format;
         }
 
@@ -3530,6 +3487,8 @@ static void uninit(struct vo *vo)
         p->video_format_desc = NULL;
     }
 
+    if (p->video_format_attachments) CFRelease(p->video_format_attachments);
+    p->video_format_attachments = NULL;
     [p->ciContext release];
     p->ciContext = nil;
     [p->mtlDevice release];
@@ -3637,6 +3596,7 @@ static const struct m_option avfoundation_options[] = {
     // Inline OSD raster height cap; 0 = display resolution. Layer upscales
     // result.
     {"osd-max-height", OPT_INT(osd_max_height), M_RANGE(0, 4320)},
+    {"subtitle-luminance", OPT_DOUBLE(subtitle_luminance), M_RANGE(1, 1000)},
     // Rasterize at video pixel density: 1:1 over displayed video rect.
     {"osd-video-res", OPT_BOOL(osd_video_res)},
     {0},
@@ -3651,6 +3611,7 @@ static const struct m_sub_options avfoundation_conf = {
         .composite_osd = true,
         .pip_composite_osd = true,
         .queue_lead_ms = 128,
+        .subtitle_luminance = 203,
         // tvOS has no PiP. Use host timebase to avoid accumulated drift
         // against mpv's audio-slaved schedule (plezy#1776).
         .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
