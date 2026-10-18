@@ -443,6 +443,48 @@ static int mp_property_generic_option(void *ctx, struct m_property *prop,
     return M_PROPERTY_NOT_IMPLEMENTED;
 }
 
+static int mp_property_native_video_statistics(void *ctx, struct m_property *prop,
+                                                int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    struct voctrl_native_video_statistics stats = {0};
+    if (!mpctx->video_out || vo_control(mpctx->video_out,
+            VOCTRL_GET_NATIVE_VIDEO_STATISTICS, &stats) <= 0)
+        return M_PROPERTY_UNAVAILABLE;
+    struct m_sub_property props[] = {
+        {"pixel-buffer-copies", SUB_PROP_INT64(stats.pixel_buffer_copies)},
+        {"sample-build-count", SUB_PROP_INT64(stats.sample_build_count)},
+        {"last-sample-build-ns", SUB_PROP_INT64(stats.last_sample_build_ns)},
+        {"total-sample-build-ns", SUB_PROP_INT64(stats.total_sample_build_ns)},
+        {0}
+    };
+    return m_property_read_sub(props, action, arg);
+}
+
+// A VO-thread fence for host-owned surfaces. This is deliberately a property,
+// not a cached option: success proves the live renderer acknowledged the fence.
+static int mp_property_external_surface_update(void *ctx, struct m_property *prop,
+                                               int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (action == M_PROPERTY_GET_TYPE) {
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_FLAG};
+        return M_PROPERTY_OK;
+    }
+    if (!mpctx->video_out)
+        return M_PROPERTY_UNAVAILABLE;
+    if (action == M_PROPERTY_SET || action == M_PROPERTY_GET) {
+        int value = action == M_PROPERTY_SET ? *(int *)arg : 0;
+        int request = action == M_PROPERTY_SET ? VOCTRL_EXTERNAL_SURFACE_UPDATE
+                                              : VOCTRL_GET_EXTERNAL_SURFACE_UPDATE;
+        int result = vo_control(mpctx->video_out, request, &value);
+        if (result <= 0) return M_PROPERTY_ERROR;
+        if (action == M_PROPERTY_GET) *(int *)arg = value;
+        return M_PROPERTY_OK;
+    }
+    return M_PROPERTY_NOT_IMPLEMENTED;
+}
+
 // Return VO external-resize result synchronously through libmpv properties;
 // option bridge drops VOCTRL result.
 static int mp_property_external_surface_size(void *ctx,
@@ -2129,6 +2171,8 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
         {"dolby-vision-profile", SUB_PROP_INT(p.dv_profile),
                         .unavailable = !p.dovi},
         {"dolby-vision-level", SUB_PROP_INT(p.dv_level),
+                        .unavailable = !p.dovi},
+        {"dolby-vision-bl-signal-compatibility-id", SUB_PROP_INT(p.dv_bl_signal_compatibility_id),
                         .unavailable = !p.dovi},
         {"metadata", SUB_PROP_KEYVALUE_LIST(tag_list),
                         .unavailable = !tags->num_keys},
@@ -4488,6 +4532,8 @@ static const struct m_property mp_properties_base[] = {
     {"display-swapchain", mp_property_vo_display_swapchain},
     {"external-surface-size", mp_property_external_surface_size},
     {"external-surface-size-live", mp_property_external_surface_size},
+    {"external-surface-update", mp_property_external_surface_update},
+    {"avfoundation-video-statistics", mp_property_native_video_statistics},
 
     {"chapter-list", mp_property_list_chapters},
     {"track-list", mp_property_list_tracks},

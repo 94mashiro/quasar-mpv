@@ -48,10 +48,13 @@ enum {
     // For VOCTRL_GET_HIDPI_SCALE changes.
     VO_EVENT_DPI                        = 1 << 6,
     VO_EVENT_FOCUS                      = 1 << 7,
+    // A successful redraw published output parameters after reconfiguration.
+    VO_EVENT_TARGET_PARAMS              = 1 << 8,
 
     // Set of events the player core may be interested in.
     VO_EVENTS_USER = VO_EVENT_RESIZE | VO_EVENT_WIN_STATE | VO_EVENT_DPI |
-                     VO_EVENT_FOCUS | VO_EVENT_AMBIENT_LIGHTING_CHANGED,
+                     VO_EVENT_FOCUS | VO_EVENT_AMBIENT_LIGHTING_CHANGED |
+                     VO_EVENT_TARGET_PARAMS,
 };
 
 enum mp_voctrl {
@@ -122,6 +125,10 @@ enum mp_voctrl {
 
     /* private to vo_gpu and vo_gpu_next */
     VOCTRL_EXTERNAL_RESIZE,
+    // Synchronous host CAMetalLayer/target transaction. int* flag in/out.
+    VOCTRL_EXTERNAL_SURFACE_UPDATE,
+    VOCTRL_GET_EXTERNAL_SURFACE_UPDATE,
+    VOCTRL_GET_NATIVE_VIDEO_STATISTICS, // struct voctrl_native_video_statistics*
 
     // Begin VO dragging.
     VOCTRL_BEGIN_DRAGGING,
@@ -133,6 +140,13 @@ enum mp_voctrl {
     // Clipboard
     VOCTRL_GET_CLIPBOARD,               // struct voctrl_clipboard*
     VOCTRL_SET_CLIPBOARD,
+};
+
+struct voctrl_native_video_statistics {
+    int64_t pixel_buffer_copies;
+    int64_t sample_build_count;
+    int64_t last_sample_build_ns;
+    int64_t total_sample_build_ns;
 };
 
 // Helper to expose what kind of content is currently playing to the VO.

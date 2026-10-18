@@ -127,6 +127,7 @@ struct mp_codec_params {
     bool dovi;
     uint8_t dv_profile;
     uint8_t dv_level;
+    uint8_t dv_bl_signal_compatibility_id;
 
     // STREAM_VIDEO + STREAM_AUDIO
     int bits_per_coded_sample;

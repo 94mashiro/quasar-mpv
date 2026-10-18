@@ -36,6 +36,7 @@
 #include "osdep/threads.h"
 #include "misc/bstr.h"
 #include "common/av_common.h"
+#include "common/av_log.h"
 #include "common/codecs.h"
 
 #include "video/fmt-conversion.h"
@@ -733,6 +734,8 @@ static void init_avctx(struct mp_filter *vd)
     AVCodecContext *avctx = ctx->avctx;
     if (!ctx->avctx)
         goto error;
+    avctx->opaque = vd;
+    mp_av_log_register_decoder(vd, vd->global);
     avctx->codec_type = AVMEDIA_TYPE_VIDEO;
     avctx->codec_id = lavc_codec->id;
     avctx->pkt_timebase = ctx->codec_timebase;
@@ -915,6 +918,7 @@ static void uninit_avctx(struct mp_filter *vd)
     av_buffer_unref(&ctx->cached_hw_frames_ctx);
 
     avcodec_free_context(&ctx->avctx);
+    mp_av_log_unregister_decoder(vd);
 
     av_buffer_unref(&ctx->hwdec_dev);
 

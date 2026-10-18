@@ -35,6 +35,7 @@
 #include "video/hwdec.h"
 #include "sub/osd.h"
 #include "avfoundation_color.h"
+#include "avfoundation_hdr10plus.h"
 
 #import <CoreMedia/CoreMedia.h>
 #import <AVFoundation/AVFoundation.h>
@@ -386,6 +387,9 @@ struct priv {
     // Log Dolby Vision geometry refusal once.
     bool dovi_geometry_skip_logged;
     bool dovi_unsupported_logged;
+    int dovi_validated_state;
+    int hdr10plus_state;
+    struct voctrl_native_video_statistics video_statistics;
 
     // Log resized-composite rejection once.
     bool composite_size_mismatch_logged;
@@ -3014,6 +3018,22 @@ static bool validate_native_dovi_frame(struct vo *vo, struct mp_image *mpi,
         report_unsupported_dovi(vo, "decoder supplied no validated native Dolby Vision sample metadata");
         return false;
     }
+    int profile = -1, compatibility = -1;
+    CFTypeRef profile_value = CVBufferGetAttachment(pixbuf,
+        CFSTR("MPVUI.NativeDolbyVisionSessionProfile"), NULL);
+    CFTypeRef compatibility_value = CVBufferGetAttachment(pixbuf,
+        CFSTR("MPVUI.NativeDolbyVisionSessionCompatibility"), NULL);
+    if (profile_value && CFGetTypeID(profile_value) == CFNumberGetTypeID())
+        CFNumberGetValue(profile_value, kCFNumberIntType, &profile);
+    if (compatibility_value && CFGetTypeID(compatibility_value) == CFNumberGetTypeID())
+        CFNumberGetValue(compatibility_value, kCFNumberIntType, &compatibility);
+    int state = (converted ? 20000 : 10000) + (profile + 1) * 100 + compatibility + 1;
+    if (p->dovi_validated_state != state) {
+        MP_INFO(vo, "MPVUI_NATIVE_DOLBY_VISION_VALIDATED: profile7-to81=%s "
+                    "session-profile=%d session-compatibility=%d\n",
+                converted ? "yes" : "no", profile, compatibility);
+        p->dovi_validated_state = state;
+    }
     return true;
 }
 
@@ -3041,6 +3061,7 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
                 return NULL;
             }
             pixbufNeedsRelease = true;
+            p->video_statistics.pixel_buffer_copies++;
         }
 
         CVPixelBufferRef finalBuffer = pixbuf;
@@ -3065,8 +3086,12 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
                 overlay = composite_yuv_frame(vo, pixbuf, CVPixelBufferGetPixelFormatType(pixbuf), false);
             CVPixelBufferRef rendered = render_video_geometry_frame(vo, overlay ?: pixbuf,
                                                                     !overlay && p->has_subtitle);
-            if (overlay) CVPixelBufferRelease(overlay);
+            if (overlay) {
+                p->video_statistics.pixel_buffer_copies++;
+                CVPixelBufferRelease(overlay);
+            }
             if (rendered) {
+                p->video_statistics.pixel_buffer_copies++;
                 if (!p->applied_geometry_last_frame) {
                     struct mp_vo_opts *opts = vo->opts;
                     MP_INFO(vo, "AVFoundation geometry rendering enabled "
@@ -3101,6 +3126,8 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
         if (!needsRelease && !applyGeometry && should_composite_into_video(p)) {
             // Composite this flip's subtitle.
             CVPixelBufferRef composited = composite_frame(vo, pixbuf);
+            if (composited)
+                p->video_statistics.pixel_buffer_copies++;
             if (composited && should_use_frame_space_osd(p) &&
                 (CVPixelBufferGetWidth(composited) != CVPixelBufferGetWidth(pixbuf) ||
                  CVPixelBufferGetHeight(composited) != CVPixelBufferGetHeight(pixbuf))) {
@@ -3178,6 +3205,26 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
             if (pixbufNeedsRelease)
                 CVPixelBufferRelease(pixbuf);
             return NULL;
+        }
+
+        const void *hdr10plus = NULL;
+        size_t hdr10plus_size = 0;
+        for (int i = 0; i < mpi->num_ff_side_data; i++) {
+            if (mpi->ff_side_data[i].type == AV_FRAME_DATA_DYNAMIC_HDR_PLUS) {
+                hdr10plus = mpi->ff_side_data[i].buf->data;
+                hdr10plus_size = mpi->ff_side_data[i].buf->size;
+                break;
+            }
+        }
+        // Static source mastering metadata remains meaningful after an overlay,
+        // but dynamic scene mapping describes the untouched original pixels.
+        int hdr_state = avf_attach_hdr10plus(buf, hdr10plus, hdr10plus_size,
+                                           finalBuffer != pixbuf);
+        if (hdr_state != p->hdr10plus_state) {
+            const char *states[] = {"absent", "attached", "invalid",
+                                    "pixels-transformed", "os-unavailable"};
+            MP_INFO(vo, "MPVUI_NATIVE_HDR10PLUS: %s\n", states[hdr_state]);
+            p->hdr10plus_state = hdr_state;
         }
 
         // Stopped timebase cannot pass equal-PTS replacement; paused
@@ -3278,7 +3325,11 @@ static void flip_page(struct vo *vo)
 
         int64_t t = mp_time_ns();
         CMSampleBufferRef video_buf = create_video_sample_buffer(vo, p->next_image);
-        p->perf.video_sample_ns += mp_time_ns() - t;
+        int64_t sample_ns = mp_time_ns() - t;
+        p->perf.video_sample_ns += sample_ns;
+        p->video_statistics.sample_build_count++;
+        p->video_statistics.last_sample_build_ns = sample_ns;
+        p->video_statistics.total_sample_build_ns += sample_ns;
 
         bool osd_enqueued = !osd_needed;
 
@@ -3426,6 +3477,10 @@ static void clear_subtitle_state(struct vo *vo)
 static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
     MP_VERBOSE(vo, "reconfig: %dx%d\n", params->w, params->h);
+    struct priv *p = vo->priv;
+    p->dovi_validated_state = p->hdr10plus_state = 0;
+    p->video_statistics = (struct voctrl_native_video_statistics){0};
+    p->dovi_unsupported_logged = false;
 
     if (params->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
         params->imgfmt != IMGFMT_VIDEOTOOLBOX) {
@@ -3512,6 +3567,9 @@ static int control(struct vo *vo, uint32_t request, void *data)
     struct priv *p = vo->priv;
 
     switch (request) {
+    case VOCTRL_GET_NATIVE_VIDEO_STATISTICS:
+        *(struct voctrl_native_video_statistics *)data = p->video_statistics;
+        return VO_TRUE;
     case VOCTRL_CHECK_EVENTS:
         update_avfoundation_options(vo);
         return VO_TRUE;
@@ -3525,6 +3583,9 @@ static int control(struct vo *vo, uint32_t request, void *data)
         sync_osd_layer_frame(vo);
         return VO_TRUE;
     case VOCTRL_RESET:
+        p->dovi_validated_state = p->hdr10plus_state = 0;
+        p->video_statistics = (struct voctrl_native_video_statistics){0};
+        p->dovi_unsupported_logged = false;
         // vo_seek_reset() runs on seek/stop/track change. Flush queued
         // samples, retain displayed frame through demux/decode to avoid black
         // flashes, matching gpu/gpu-next. Drop OSD layer so stale cues

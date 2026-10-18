@@ -890,6 +890,8 @@ static void handle_vo_events(struct MPContext *mpctx)
         mp_notify(mpctx, MP_EVENT_FOCUS, NULL);
     if (events & VO_EVENT_AMBIENT_LIGHTING_CHANGED)
         mp_notify(mpctx, MP_EVENT_AMBIENT_LIGHTING_CHANGED, NULL);
+    if (events & VO_EVENT_TARGET_PARAMS)
+        mp_notify_property(mpctx, "video-target-params");
 }
 
 static void handle_sstep(struct MPContext *mpctx)

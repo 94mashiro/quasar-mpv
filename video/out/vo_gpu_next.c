@@ -134,6 +134,8 @@ struct priv {
     bool is_interpolated;
     bool want_reset;
     bool frame_pending;
+    bool external_surface_update;
+    bool target_params_pending;
 
     pl_options pars;
     struct m_config_cache *opts_cache;
@@ -1005,6 +1007,11 @@ static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
+    // The host may change CAMetalLayer and target options after a synchronous
+    // fence. Do not acquire, render, or present until the complete contract is
+    // installed. The VO thread remains free to process options and controls.
+    if (p->external_surface_update)
+        return VO_FALSE;
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
     update_options(vo);
@@ -1455,6 +1462,14 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
     mp_mutex_unlock(&vo->params_mutex);
 
+    // Paused playback need not produce another core tick. Notify observers
+    // only once the new output parameters exist, rather than leaving the
+    // transient unavailable value from reconfiguration cached indefinitely.
+    if (p->target_params_pending) {
+        p->target_params_pending = false;
+        vo_event(vo, VO_EVENT_TARGET_PARAMS);
+    }
+
     p->is_interpolated = pts_offset != 0 && mix.num_frames > 1;
     valid = true;
     // fall through
@@ -1471,6 +1486,8 @@ done:
 static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
+    if (p->external_surface_update)
+        return;
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
 
     if (p->frame_pending) {
@@ -1535,6 +1552,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     mp_mutex_lock(&vo->params_mutex);
     vo->target_params = NULL;
     mp_mutex_unlock(&vo->params_mutex);
+    p->target_params_pending = true;
     return 0;
 }
 
@@ -1824,6 +1842,28 @@ static int control(struct vo *vo, uint32_t request, void *data)
     struct priv *p = vo->priv;
 
     switch (request) {
+    case VOCTRL_GET_EXTERNAL_SURFACE_UPDATE:
+        *(int *)data = p->external_surface_update;
+        return VO_TRUE;
+    case VOCTRL_EXTERNAL_SURFACE_UPDATE: {
+        bool suspend = *(int *)data;
+        if (suspend && !p->external_surface_update) {
+            // Controls execute on this VO thread between draws. Complete an
+            // outstanding presentation before changing ownership, then wait
+            // for GPU use of the old swapchain to finish before acknowledging.
+            if (p->frame_pending)
+                flip_page(vo);
+            p->external_surface_update = true;
+            pl_gpu_finish(p->gpu);
+        } else if (!suspend && p->external_surface_update) {
+            update_options(vo);
+            p->external_surface_update = false;
+            p->target_params_pending = true;
+            p->want_reset = true;
+            vo->want_redraw = true;
+        }
+        return VO_TRUE;
+    }
     case VOCTRL_SET_PANSCAN:
         resize(vo);
         return VO_TRUE;

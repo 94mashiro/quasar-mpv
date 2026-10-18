@@ -59,6 +59,45 @@ static struct mp_log *log_root, *log_decaudio, *log_decvideo, *log_demuxer;
 static bool log_print_prefix = true;
 static bstr log_buffer;
 
+struct decoder_log_owner {
+    void *opaque;
+    struct mp_log *log;
+    struct decoder_log_owner *next;
+};
+static struct decoder_log_owner *decoder_log_owners;
+static void mp_msg_av_log_callback(void *, int, const char *, va_list);
+
+void mp_av_log_register_decoder(void *opaque, struct mpv_global *global)
+{
+    mp_mutex_lock(&log_lock);
+    struct decoder_log_owner *owner = talloc_zero(NULL, struct decoder_log_owner);
+    owner->opaque = opaque;
+    owner->log = mp_log_new(owner, global->log, "ffmpeg/video");
+    owner->next = decoder_log_owners;
+    decoder_log_owners = owner;
+    av_log_set_callback(mp_msg_av_log_callback);
+    mp_mutex_unlock(&log_lock);
+}
+
+void mp_av_log_unregister_decoder(void *opaque)
+{
+    mp_mutex_lock(&log_lock);
+    struct decoder_log_owner **link = &decoder_log_owners;
+    while (*link) {
+        struct decoder_log_owner *owner = *link;
+        if (owner->opaque == opaque) {
+            *link = owner->next;
+            talloc_free(owner);
+            break;
+        }
+        link = &owner->next;
+    }
+    if (!decoder_log_owners && !log_mpv_instance)
+        av_log_set_callback(av_log_default_callback);
+    mp_mutex_unlock(&log_lock);
+}
+
+
 static int av_log_level_to_mp_level(int av_level)
 {
     if (av_level > AV_LOG_VERBOSE)
@@ -123,6 +162,25 @@ static void mp_msg_av_log_callback(void *ptr, int level, const char *fmt,
     // Note: mp_log is thread-safe, but destruction of the log instances is not.
     mp_mutex_lock(&log_lock);
 
+    // FFmpeg's legacy global log belongs to the first player. Never send
+    // state-changing native diagnostics there: opaque identifies the actual
+    // decoder, including FFmpeg's copied frame-thread contexts. These stable
+    // application signals use info visibility even though generic AV_LOG_INFO
+    // is intentionally mapped to verbose for normal FFmpeg chatter.
+    if (avc && !strcmp(avc->class_name, "AVCodecContext") &&
+        !strncmp(fmt, "MPVUI_", 6)) {
+        AVCodecContext *avctx = ptr;
+        for (struct decoder_log_owner *owner = decoder_log_owners; owner; owner = owner->next) {
+            if (owner->opaque == avctx->opaque) {
+                mp_msg_va(owner->log, mp_level == MSGL_V ? MSGL_INFO : mp_level, fmt, vl);
+                goto done;
+            }
+        }
+        // An unowned callback may outlive a decoder or come from another
+        // library. It cannot change any libmpv player's state.
+        goto done;
+    }
+
     if (!log_mpv_instance) {
         mp_mutex_unlock(&log_lock);
         // Fallback to stderr
@@ -175,7 +233,8 @@ void uninit_libav(struct mpv_global *global)
 {
     mp_mutex_lock(&log_lock);
     if (log_mpv_instance == global) {
-        av_log_set_callback(av_log_default_callback);
+        if (!decoder_log_owners)
+            av_log_set_callback(av_log_default_callback);
         log_mpv_instance = NULL;
         talloc_free(log_root);
     }
