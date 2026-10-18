@@ -21,9 +21,11 @@ for g in plan['segments']:
     lines = list(orig[g['from'] - 1:g['to']]); di = g['decl'] - g['from']
     cover.update(range(g['from'], g['to'] + 1))
     if g['target'] == 'HI':
-        assert lines[di].startswith('static ') and not lines[di].startswith('static inline'); lines[di] = 'static inline ' + lines[di][7:]
+        if not lines[di].startswith('static ') or lines[di].startswith('static inline'): bad += 1; print('HI decl not plain static', g['decl'])
+        lines[di] = 'static inline ' + lines[di][7:]
     if g['fn'] in exp:
-        assert lines[di].startswith('static '); lines[di] = lines[di][7:]
+        if not lines[di].startswith('static '): bad += 1; print('exported decl not static', g['decl'])
+        lines[di] = lines[di][7:]
         sig = []
         for l in lines[di:]:
             if l.strip() == '{': break
@@ -39,14 +41,23 @@ for g in plan['segments']:
 missing = [i for i in range(54, len(orig) + 1) if i not in cover]
 lic = '\n'.join(orig[:16]); inc = '\n'.join(orig[16:53]).strip('\n')
 for f, s in new.items():
+    # 段与段之间只能是空行
+    prev = None
+    for a, b in spans[f]:
+        if prev is not None and s[prev:a].strip('\n'): bad += 1; print(f, 'text between segments:', repr(s[prev:a][:60]))
+        prev = b
+    head = lic + ('\n\n// Shared by' if f == 'vo_avfoundation_priv.h' else '\n\n#include "vo_avfoundation_priv.h"\n')
+    if not s.startswith(head): bad += 1; print(f, 'unexpected file header')
     for a, b in reversed(spans[f]): s = s[:a] + s[b:]
     s = s.replace(lic, '', 1)
     if f == 'vo_avfoundation_priv.h':
-        assert inc in s, 'include block changed'; s = s.replace(inc, '', 1)
+        if inc not in s: bad += 1; print('include block changed')
+        s = s.replace(inc, '', 1)
         s = s.replace('// Shared by the vo_avfoundation*.m / avfoundation_*.m files: state, options, small\n'
                       '// helpers and the functions one file calls in another.', '', 1).replace('#pragma once', '', 1)
         for pr in protos:
-            assert s.count(pr) == 1, 'declaration missing: ' + pr[:60]; s = s.replace(pr, '', 1)
+            if s.count(pr) != 1: bad += 1; print('declaration missing: ' + pr[:60])
+            s = s.replace(pr, '', 1)
     else:
         s = s.replace('#include "vo_avfoundation_priv.h"', '', 1)
     extra = [l for l in s.split('\n') if l.strip()]
