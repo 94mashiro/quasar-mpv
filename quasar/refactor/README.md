@@ -21,3 +21,7 @@ git show <拆分前的提交>:audio/out/ao_avfoundation.m > /tmp/ao_orig.m
 python3 quasar/refactor/ao_verify.py /tmp/ao_orig.m .
 python3 quasar/refactor/vo_compile.py . ao
 ```
+
+`ao_plan.json` 是这次的分段和改名表。`ao_split.py` 只适用于拆分前的那份文件，留作记录；在已拆的树上重跑会覆盖源文件。
+
+`ao_avfoundation.m` 是上游文件。升级 mpv 时上游如果改了 `struct priv` 前几个字段、`@interface AVObserver` 或 `CMTimeGetNanoseconds`，冲突会落在拆分提交上，要把改动挪进 `ao_avfoundation_priv.h`。

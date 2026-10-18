@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""把 audio/out/ao_avfoundation.m 按职责切成两个文件（只搬代码，压缩音频 AVPlayer 旁路单独成文件）。用法：split.py <quasar-mpv>
+"""把 audio/out/ao_avfoundation.m 按职责切成两个文件（只搬代码，压缩音频 AVPlayer 旁路单独成文件）。用法：ao_split.py <quasar-mpv>
 分配表：声明起始行 -> 目标。上方紧挨的注释随声明走。跨文件调用的 static 函数去掉 static、补 ao_avf_ 前缀、在共享头里声明。"""
 import re, sys, os, json
 HERE = os.path.dirname(os.path.abspath(__file__))
