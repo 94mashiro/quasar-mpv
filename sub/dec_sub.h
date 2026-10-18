@@ -34,6 +34,8 @@ struct sd_times {
 };
 
 struct sub_text_region {
+    double start;
+    double end;
     char *text;
     // NULL: automatic placement. Non-NULL, even empty: raw WebVTT cue
     // settings.
@@ -64,6 +66,7 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
 char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
 struct sub_text_snapshot *sub_get_text_snapshot(struct dec_sub *sub,
                                                 void *ta_parent, double pts);
+struct sub_text_snapshot *sub_get_text_cues(struct dec_sub *sub, void *ta_parent);
 char *sub_ass_get_extradata(struct dec_sub *sub);
 struct sd_times sub_get_times(struct dec_sub *sub, double pts);
 void sub_reset(struct dec_sub *sub);

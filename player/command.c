@@ -6439,6 +6439,86 @@ static void cmd_show_progress(void *p)
     mp_wakeup_core(mpctx);
 }
 
+// Read the source on a worker, using its own demuxer and subtitle decoder.
+// In particular, unselected embedded tracks must not depend on playback's
+// packet cache or seek preroll. Cancellation also interrupts network reads.
+static void cmd_sub_text_cues(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct MPContext *mpctx = cmd->mpctx;
+    struct track *track = mp_track_by_tid(mpctx, STREAM_SUB, cmd->args[0].v.i);
+    cmd->success = false;
+    if (!track || !track->stream || !track->demuxer || mpctx->stop_play)
+        return;
+    const char *codec = track->stream->codec->codec;
+    if (!codec || !(strcmp(codec, "subrip") == 0 || strcmp(codec, "srt") == 0 ||
+                   strcmp(codec, "webvtt") == 0 || strcmp(codec, "webvtt-webm") == 0 ||
+                   strcmp(codec, "ttml") == 0 || strcmp(codec, "mov_text") == 0 ||
+                   strcmp(codec, "text") == 0))
+        return;
+    if (!track->demuxer->seekable || track->demuxer->partially_seekable ||
+        (!track->demuxer->fully_read &&
+         (!isfinite(track->demuxer->duration) || track->demuxer->duration < 0)) ||
+        strcmp(track->demuxer->desc->name, "timeline") == 0)
+        return;
+
+    codec = talloc_strdup(cmd, codec);
+    char *url = talloc_strdup(cmd, track->demuxer->filename);
+    int stream_index = track->stream->index;
+    bool rebase = !track->is_external && mpctx->opts->rebase_start_time;
+    struct demuxer_params params = {
+        .is_top_level = true,
+        .stream_flags = track->demuxer->stream_origin,
+        .force_format = talloc_strdup(cmd, track->demuxer->desc->name),
+    };
+    struct mpv_global *global = mpctx->global;
+    mp_core_unlock(mpctx);
+
+    struct demuxer *demux = demux_open_url(url, &params, cmd->abort->cancel, global);
+    struct dec_sub *sub = NULL;
+    if (!demux || !demux->seekable || demux->partially_seekable ||
+        stream_index >= demux_get_num_stream(demux))
+        goto done;
+    struct sh_stream *sh = demux_get_stream(demux, stream_index);
+    if (!sh || sh->type != STREAM_SUB || strcmp(sh->codec->codec, codec) != 0)
+        goto done;
+    if (rebase)
+        demux_set_ts_offset(demux, -demux->start_time);
+    demuxer_select_track(demux, sh, MP_NOPTS_VALUE, true);
+    struct track isolated_track = {.stream = sh};
+    sub = sub_create(global, &isolated_track,
+                     talloc_zero(NULL, struct attachment_list), 0);
+    if (!sub || !sub_can_preload(sub))
+        goto done;
+    demux_start_thread(demux);
+    sub_preload(sub);
+    if (mp_cancel_test(cmd->abort->cancel))
+        goto done;
+    struct sub_text_snapshot *cues = sub_get_text_cues(sub, cmd);
+    node_init(&cmd->result, MPV_FORMAT_NODE_ARRAY, NULL);
+    for (int n = 0; n < cues->num_regions; n++) {
+        struct sub_text_region *cue = &cues->regions[n];
+        struct mpv_node *entry = node_array_add(&cmd->result, MPV_FORMAT_NODE_MAP);
+        node_map_add_double(entry, "start", cue->start);
+        node_map_add_double(entry, "end", cue->end);
+        node_map_add_string(entry, "text", cue->text);
+        if (cue->webvtt_settings) {
+            node_map_add_string(entry, "format", "webvtt");
+            node_map_add_string(entry, "settings", cue->webvtt_settings);
+        }
+    }
+    cmd->success = true;
+done:
+    sub_destroy(sub);
+    if (demux) {
+        demux_stop_thread(demux);
+        demux_free(demux);
+    }
+    mp_core_lock(mpctx);
+    if (mp_cancel_test(cmd->abort->cancel))
+        cmd->success = false;
+}
+
 static void cmd_track_add(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
@@ -7384,6 +7464,12 @@ const struct mp_cmd_def mp_cmds[] = {
     { "show-progress", cmd_show_progress, .allow_auto_repeat = true,
         .is_noisy = true },
 
+    { "sub-text-cues", cmd_sub_text_cues,
+        {{"id", OPT_INT(v.i)}},
+        .spawn_thread = true,
+        .can_abort = true,
+        .abort_on_playback_end = true,
+    },
     { "sub-add", cmd_track_add,
         {
             {"url", OPT_STRING(v.s)},

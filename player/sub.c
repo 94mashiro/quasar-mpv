@@ -33,6 +33,7 @@
 #include "video/mp_image.h"
 
 #include "core.h"
+#include "command.h"
 
 // 0: primary sub, 1: secondary sub, -1: not selected
 static int get_order(struct MPContext *mpctx, struct track *track)
@@ -125,6 +126,11 @@ static bool update_subtitle(struct MPContext *mpctx, double video_pts,
     bool packets_read = false;
     bool sub_updated = false;
     sub_read_packets(dec_sub, video_pts, mpctx->paused, &packets_read, &sub_updated);
+
+    // Paused seeks and track switches can decode cues after PLAYBACK_RESTART.
+    // There may be no subsequent video tick to notify property observers.
+    if (sub_updated || track->redraw_subs)
+        mp_notify_property(mpctx, "sub-text-snapshot");
 
     double osd_pts = osd_get_force_video_pts(mpctx->osd);
 

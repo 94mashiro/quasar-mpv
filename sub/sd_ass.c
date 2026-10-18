@@ -1049,16 +1049,16 @@ static void get_text_snapshot(struct sd *sd, double pts,
     struct sd_ass_priv *ctx = sd->priv;
     ASS_Track *track = ctx->ass_track;
 
-    if (!ctx->is_converted || pts == MP_NOPTS_VALUE ||
-        sd->opts->sub_forced_events_only)
+    bool all = pts == MP_NOPTS_VALUE;
+    if (!ctx->is_converted || (!all && sd->opts->sub_forced_events_only))
         return;
 
-    long long ipts = find_timestamp(sd, pts);
+    long long ipts = all ? 0 : find_timestamp(sd, pts);
 
     for (int n = 0; n < track->n_events; n++) {
         ASS_Event *event = &track->events[n];
-        if (ipts < event->Start || ipts >= event->Start + event->Duration ||
-            !event->Text)
+        if ((!all && (ipts < event->Start || ipts >= event->Start + event->Duration)) ||
+            event->Duration <= 0 || !event->Text)
             continue;
 
         bstr text = {0};
@@ -1070,6 +1070,8 @@ static void get_text_snapshot(struct sd *sd, double pts,
 
         const char *settings = find_webvtt_settings(ctx, event);
         struct sub_text_region region = {
+            .start = event->Start / 1000.0,
+            .end = (event->Start + event->Duration) / 1000.0,
             .text = bstrto0(snapshot, text),
             .webvtt_settings = settings ? talloc_strdup(snapshot, settings) : NULL,
         };

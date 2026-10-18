@@ -470,6 +470,19 @@ struct sub_text_snapshot *sub_get_text_snapshot(struct dec_sub *sub,
     return snapshot;
 }
 
+// The caller owns an independent, fully preloaded decoder. This does not
+// change playback position, visibility, selected tracks, or the live decoder.
+struct sub_text_snapshot *sub_get_text_cues(struct dec_sub *sub, void *ta_parent)
+{
+    struct sub_text_snapshot *snapshot =
+        talloc_zero(ta_parent, struct sub_text_snapshot);
+    mp_mutex_lock(&sub->lock);
+    if (sub->sd->driver->get_text_snapshot)
+        sub->sd->driver->get_text_snapshot(sub->sd, MP_NOPTS_VALUE, snapshot);
+    mp_mutex_unlock(&sub->lock);
+    return snapshot;
+}
+
 char *sub_ass_get_extradata(struct dec_sub *sub)
 {
     char *data = NULL;
