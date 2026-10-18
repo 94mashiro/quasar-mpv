@@ -73,6 +73,7 @@ enum avf_presentation_mode {
 };
 
 struct avfoundation_opts {
+    int native_dovi_profile7;
     bool composite_osd;
     bool pip_composite_osd;
     int queue_lead_ms;
@@ -1179,6 +1180,8 @@ static AVBufferRef *create_videotoolbox_device_ref(struct vo *vo)
     AVHWDeviceContext *device = (AVHWDeviceContext *)device_ref->data;
     AVVTDeviceContext *native = device->hwctx;
     native->enable_native_dolby_vision = 1;
+    struct priv *p = vo->priv;
+    native->convert_native_dolby_vision_profile7 = p->opts->native_dovi_profile7;
     if (av_hwdevice_ctx_init(device_ref) < 0) {
         MP_ERR(vo, "Failed to init VideoToolbox device\n");
         av_buffer_unref(&device_ref);
@@ -3021,7 +3024,17 @@ static void report_unsupported_dovi(struct vo *vo, const char *reason)
 static bool validate_native_dovi_frame(struct vo *vo, struct mp_image *mpi,
                                        CVPixelBufferRef pixbuf)
 {
-    if (mpi->params.repr.sys != PL_COLOR_SYSTEM_DOLBYVISION)
+    struct priv *p = vo->priv;
+    CFTypeRef converted = pixbuf ? CVBufferGetAttachment(pixbuf,
+        CFSTR("MPVUI.NativeDolbyVisionProfile7To81"), NULL) : NULL;
+    // Converted DV still requires native session identity and decoder RPU,
+    // even without container color tags.
+    if (converted && (!CFEqual(converted, kCFBooleanTrue) ||
+                      !p->opts->native_dovi_profile7)) {
+        report_unsupported_dovi(vo, "P7 conversion was not explicitly enabled for this output");
+        return false;
+    }
+    if (mpi->params.repr.sys != PL_COLOR_SYSTEM_DOLBYVISION && !converted)
         return true;
     if (mpi->imgfmt != IMGFMT_VIDEOTOOLBOX) {
         report_unsupported_dovi(vo, "software Dolby Vision needs libplacebo reshaping");
@@ -3611,6 +3624,10 @@ static const struct m_option priv_options[] = {
 #undef OPT_BASE_STRUCT
 #define OPT_BASE_STRUCT struct avfoundation_opts
 static const struct m_option avfoundation_options[] = {
+    // Lossy mode 2 drops enhancement layer and resets luma/chroma mapping.
+    // Latched at decoder creation; changes require media reload.
+    {"native-dovi-profile7", OPT_CHOICE(native_dovi_profile7,
+        {"no", 0}, {"p8.1", 1})},
     {"composite-osd", OPT_BOOL(composite_osd)},
     {"pip-composite-osd", OPT_BOOL(pip_composite_osd)},
     {"queue-lead-ms", OPT_INT(queue_lead_ms), M_RANGE(0, 1000)},
@@ -3630,6 +3647,7 @@ static const struct m_sub_options avfoundation_conf = {
     .opts = avfoundation_options,
     .size = sizeof(struct avfoundation_opts),
     .defaults = &(const struct avfoundation_opts){
+        .native_dovi_profile7 = 0,
         .composite_osd = true,
         .pip_composite_osd = true,
         .queue_lead_ms = 128,
