@@ -507,14 +507,14 @@
   {
    "from": 1903,
    "to": 1923,
-   "target": "BUF",
+   "target": "OSD",
    "decl": 1903,
    "fn": "get_yuv_coefficients"
   },
   {
    "from": 1924,
    "to": 1980,
-   "target": "BUF",
+   "target": "OSD",
    "decl": 1924,
    "fn": "copy_pixel_buffer_planes"
   },
@@ -1045,8 +1045,6 @@
   "create_output_pool": "avf_create_output_pool",
   "restore_dolby_vision_transfer": "avf_restore_dolby_vision_transfer",
   "tag_pixel_buffer_pixel_aspect": "avf_tag_pixel_buffer_pixel_aspect",
-  "get_yuv_coefficients": "avf_get_yuv_coefficients",
-  "copy_pixel_buffer_planes": "avf_copy_pixel_buffer_planes",
   "clear_sw_upload_metadata": "avf_clear_sw_upload_metadata",
   "upload_420p1x_to_p010": "avf_upload_420p1x_to_p010",
   "upload_software_frame": "avf_upload_software_frame",

@@ -41,6 +41,8 @@
 #include "sub/osd.h"
 #include "avfoundation_color.h"
 #include "avfoundation_hdr10plus.h"
+#include "avfoundation_vivid.h"
+#include "avfoundation_fel.h"
 #include <libavutil/dovi_meta.h>
 #include <libavutil/hdr_dynamic_vivid_metadata.h>
 
@@ -52,8 +54,6 @@
 #import <Metal/Metal.h>
 #import <TargetConditionals.h>
 #include <pthread.h>
-#include "avfoundation_vivid.h"
-#include "avfoundation_fel.h"
 
 struct avf_render_geometry {
     int w, h;
@@ -516,10 +516,6 @@ void avf_restore_dolby_vision_transfer(CVPixelBufferRef pixbuf,
                                           const struct mp_image_params *params);
 
 void avf_tag_pixel_buffer_pixel_aspect(struct vo *vo, CVPixelBufferRef pixbuf);
-
-void avf_get_yuv_coefficients(CVPixelBufferRef pixbuf, double *kr, double *kb);
-
-bool avf_copy_pixel_buffer_planes(CVPixelBufferRef src, CVPixelBufferRef dst);
 
 void avf_clear_sw_upload_metadata(struct priv *p);
 

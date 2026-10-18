@@ -2,6 +2,7 @@
 """把 video/out/vo_avfoundation.m 按职责切成多个文件（只搬代码）。用法：split.py <quasar-mpv>
 分配表：声明起始行 -> 目标。上方紧挨的注释随声明走。跨文件调用的 static 函数去掉 static、补 avf_ 前缀、在共享头里声明。"""
 import re, sys, os, json
+HERE = os.path.dirname(os.path.abspath(__file__))
 Q = sys.argv[1]; SRC = f'{Q}/video/out/vo_avfoundation.m'
 L = open(SRC).read().split('\n')          # L[i-1] 是第 i 行
 N = len(L)
@@ -13,7 +14,7 @@ A = {54:H,60:H,77:H,82:H,109:H,133:H,147:M,156:M,238:M,244:M,281:H,283:H,454:M,
      1279:OSD,1298:OSD,1322:OSD,1366:OSD,1416:OSD,1422:OSD,1436:OSD,1449:OSD,
      1457:M,1462:M,1518:M,1531:M,1590:M,1631:M,1657:H,
      1659:BUF,1672:BUF,1687:BUF,1692:BUF,1715:BUF,1776:BUF,1825:OSD,1838:BUF,
-     1847:BUF,1857:BUF,1873:BUF,1903:BUF,1924:BUF,1981:OSD,1986:OSD,1993:OSD,
+     1847:BUF,1857:BUF,1873:BUF,1903:OSD,1924:OSD,1981:OSD,1986:OSD,1993:OSD,
      2021:BUF,2032:BUF,2039:BUF,2046:BUF,2074:OSD,2085:OSD,2097:OSD,2132:OSD,2146:OSD,
      2160:BUF,2174:BUF,2195:BUF,2212:BUF,2238:BUF,2265:BUF}
 for s in [2370,2430,2458,2496,2534,2643,2661,2678,2695,2714,2736,2771,2829,2882,2942,2958,
@@ -83,12 +84,11 @@ for t, gs in files.items():
         g['out'] = apply_ren('\n'.join(lines))
 lic = '\n'.join(L[0:16])
 inc = [l for l in L[16:53]]
-hdr_only = {'#include "avfoundation_vivid.h"', '#include "avfoundation_fel.h"'}
-H_inc = '\n'.join(l for l in inc if l.strip() not in hdr_only)
+H_inc = '\n'.join(inc)
 out = {}
 out['vo_avfoundation_priv.h'] = (lic + '\n\n// Shared by the vo_avfoundation*.m / avfoundation_*.m files: state, options, small\n'
     '// helpers and the functions one file calls in another.\n\n#pragma once\n' + H_inc.rstrip() + '\n'
-    + '#include "avfoundation_vivid.h"\n#include "avfoundation_fel.h"\n\n'
+    + '\n'
     + '\n'.join(g['out'] for g in files[H]).rstrip() + '\n\n' + '\n\n'.join(protos) + '\n')
 names = {M: 'vo_avfoundation.m', SL: 'avfoundation_subtitle_layer.m', BUF: 'avfoundation_buffers.m',
          OSD: 'avfoundation_osd.m', HDR: 'avfoundation_hdr.m'}
@@ -96,6 +96,6 @@ for t, fn in names.items():
     out[fn] = lic + '\n\n#include "vo_avfoundation_priv.h"\n\n' + '\n'.join(g['out'] for g in files[t]).strip('\n') + '\n'
 for fn, s in out.items(): open(f'{Q}/video/out/{fn}', 'w').write(s)
 json.dump({'segments': [{k: g[k] for k in ('from', 'to', 'target', 'decl', 'fn')} for g in segs],
-           'exported': exported}, open('/tmp/qa-fel/split/plan.json', 'w'), indent=1)
+           'exported': exported}, open(os.path.join(HERE, 'plan.json'), 'w'), indent=1)
 print('exported', len(exported), 'renamed', len(ren)); print(sorted(ren.items()))
 print({fn: s.count('\n') for fn, s in out.items()})

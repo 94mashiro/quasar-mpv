@@ -3,7 +3,9 @@
 再把这些 .o 合成一个，列出其中以 avf_/vo_avf 开头却没定义的符号（跨文件断链）。用法：vo_compile.py <quasar-mpv 路径>"""
 import glob, json, os, shlex, subprocess, sys, tempfile
 q = os.path.abspath(sys.argv[1])
-w = glob.glob(os.path.expanduser('~/workspace/build-libmpv-ios/MPVUI/.build/mpvbuild/work/mpv/ios-arm64/*/build'))[0]
+dirs = glob.glob(os.path.expanduser('~/workspace/build-libmpv-ios/MPVUI/.build/mpvbuild/work/mpv/ios-arm64/*/build'))
+if not dirs: sys.exit('没有 mpvbuild 的 iOS 构建目录：先在 quasar-app 跑一次 iosApp/tool/build_libmpv.sh')
+w = max(dirs, key=os.path.getmtime)  # 最近一次构建的参数
 e = next(x for x in json.load(open(f'{w}/compile_commands.json')) if x['file'].endswith('vo_avfoundation.m'))
 args = shlex.split(e['command'])
 out = tempfile.mkdtemp()

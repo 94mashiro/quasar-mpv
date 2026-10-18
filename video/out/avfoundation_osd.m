@@ -208,6 +208,84 @@ static OSType ci_output_format_for_source(CVPixelBufferRef buffer)
     return kCVPixelFormatType_32BGRA;
 }
 
+static void get_yuv_coefficients(CVPixelBufferRef pixbuf, double *kr, double *kb)
+{
+    *kr = 0.2126;
+    *kb = 0.0722;
+
+    CFTypeRef matrix = CVBufferGetAttachment(pixbuf, kCVImageBufferYCbCrMatrixKey, NULL);
+    if (!matrix)
+        return;
+
+    if (CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_2020)) {
+        *kr = 0.2627;
+        *kb = 0.0593;
+    } else if (CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4)) {
+        *kr = 0.299;
+        *kb = 0.114;
+    } else if (CFEqual(matrix, kCVImageBufferYCbCrMatrix_SMPTE_240M_1995)) {
+        *kr = 0.212;
+        *kb = 0.087;
+    }
+}
+
+static bool copy_pixel_buffer_planes(CVPixelBufferRef src, CVPixelBufferRef dst)
+{
+    CVReturn src_status = CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    if (src_status != kCVReturnSuccess)
+        return false;
+
+    CVReturn dst_status = CVPixelBufferLockBaseAddress(dst, 0);
+    if (dst_status != kCVReturnSuccess) {
+        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+        return false;
+    }
+
+    size_t planes = CVPixelBufferGetPlaneCount(src);
+    bool ok = planes == CVPixelBufferGetPlaneCount(dst);
+    if (ok && planes > 0) {
+        for (size_t plane = 0; plane < planes; plane++) {
+            uint8_t *src_base = CVPixelBufferGetBaseAddressOfPlane(src, plane);
+            uint8_t *dst_base = CVPixelBufferGetBaseAddressOfPlane(dst, plane);
+            size_t src_stride = CVPixelBufferGetBytesPerRowOfPlane(src, plane);
+            size_t dst_stride = CVPixelBufferGetBytesPerRowOfPlane(dst, plane);
+            size_t height = MPMIN(CVPixelBufferGetHeightOfPlane(src, plane),
+                                  CVPixelBufferGetHeightOfPlane(dst, plane));
+            size_t bytes = MPMIN(src_stride, dst_stride);
+            if (!src_base || !dst_base) {
+                ok = false;
+                break;
+            }
+            if (src_stride == dst_stride) {
+                memcpy(dst_base, src_base, bytes * height);
+            } else {
+                for (size_t y = 0; y < height; y++)
+                    memcpy(dst_base + y * dst_stride, src_base + y * src_stride, bytes);
+            }
+        }
+    } else if (ok) {
+        uint8_t *src_base = CVPixelBufferGetBaseAddress(src);
+        uint8_t *dst_base = CVPixelBufferGetBaseAddress(dst);
+        size_t src_stride = CVPixelBufferGetBytesPerRow(src);
+        size_t dst_stride = CVPixelBufferGetBytesPerRow(dst);
+        size_t height = MPMIN(CVPixelBufferGetHeight(src), CVPixelBufferGetHeight(dst));
+        size_t bytes = MPMIN(src_stride, dst_stride);
+        ok = src_base && dst_base;
+        if (ok) {
+            if (src_stride == dst_stride) {
+                memcpy(dst_base, src_base, bytes * height);
+            } else {
+                for (size_t y = 0; y < height; y++)
+                    memcpy(dst_base + y * dst_stride, src_base + y * src_stride, bytes);
+            }
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    return ok;
+}
+
 static int clip_u8(double value)
 {
     return MPCLAMP((int)(value + 0.5), 0, 255);
@@ -1072,7 +1150,7 @@ static struct avf_overlay_color get_overlay_color(struct vo *vo, CVPixelBufferRe
         .white_nits = p->opts->subtitle_luminance,
         .transfer = AVF_BT1886,
     };
-    avf_get_yuv_coefficients(videoBuffer, &color.kr, &color.kb);
+    get_yuv_coefficients(videoBuffer, &color.kr, &color.kb);
     CFTypeRef trc = CVBufferGetAttachment(videoBuffer, kCVImageBufferTransferFunctionKey, NULL);
     if (trc) {
         if (CFEqual(trc, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ)) color.transfer = AVF_PQ;
@@ -1173,7 +1251,7 @@ CVPixelBufferRef avf_composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBu
         }
 
         copy_pixel_buffer_metadata(videoBuffer, outputBuffer, sourceFormat);
-        if (!avf_copy_pixel_buffer_planes(videoBuffer, outputBuffer)) {
+        if (!copy_pixel_buffer_planes(videoBuffer, outputBuffer)) {
             CVPixelBufferRelease(outputBuffer);
             return NULL;
         }

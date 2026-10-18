@@ -1,45 +1,55 @@
 #!/usr/bin/env python3
-"""拆分等价检查：原文件每一段（按 plan.json）只经过改名和 static/inline 调整后，必须原样出现在目标新文件里；
-新文件里除这些段以外只允许许可头、include、pragma、注释和函数声明。用法：verify.py <原 vo_avfoundation.m> <quasar-mpv>"""
-import json, re, sys
+"""拆分等价检查（严格）：对原文件每一段只做预期的变换（目标为 HI 的声明行加 inline；跨文件函数的声明行去 static；
+删掉这些函数原来的 static 前置声明；按 plan 改名），结果必须按原顺序逐字出现在目标文件里。
+各文件剩下的只能是：许可头、原文件的 include 块（共享头里）、共享头的 include、#pragma once、共享头开头的说明注释、
+跨文件函数的声明（与定义的签名逐字一致）。用法：verify.py <拆分前的 vo_avfoundation.m> <quasar-mpv>"""
+import json, os, re, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
 orig = open(sys.argv[1]).read().split('\n'); Q = sys.argv[2]
-plan = json.load(open('/tmp/qa-fel/split/plan.json'))
-ren = {k: v for k, v in plan['exported'].items() if k != v}
+plan = json.load(open(os.path.join(HERE, 'plan.json')))
+exp = plan['exported']; ren = {k: v for k, v in exp.items() if k != v}
 names = {'H': 'vo_avfoundation_priv.h', 'HI': 'vo_avfoundation_priv.h', 'M': 'vo_avfoundation.m',
          'SL': 'avfoundation_subtitle_layer.m', 'BUF': 'avfoundation_buffers.m', 'OSD': 'avfoundation_osd.m', 'HDR': 'avfoundation_hdr.m'}
-proto_re = re.compile(r'^static .*\b(%s)\s*\(.*\);\s*$' % '|'.join(map(re.escape, plan['exported'])))
-def norm(s):
-    s = re.sub(r'\bstatic\s+', '', s); s = re.sub(r'\binline\s+', '', s)
-    return s
+proto_re = re.compile(r'^static .*\b(%s)\s*\(.*\);\s*$' % '|'.join(map(re.escape, exp)))
 def renamed(s):
     for k, v in ren.items(): s = re.sub(r'\b%s\b' % re.escape(k), v, s)
     return s
 new = {f: open(f'{Q}/video/out/{f}').read() for f in set(names.values())}
-rest = dict(new)
-bad = 0
-cover = set()
+pos = {f: 0 for f in new}; spans = {f: [] for f in new}; protos = []
+bad = 0; cover = set()
 for g in plan['segments']:
-    lines = [l for l in orig[g['from'] - 1:g['to']] if not proto_re.match(l)]
+    lines = list(orig[g['from'] - 1:g['to']]); di = g['decl'] - g['from']
     cover.update(range(g['from'], g['to'] + 1))
-    seg = norm(renamed('\n'.join(lines))).strip('\n')
+    if g['target'] == 'HI':
+        assert lines[di].startswith('static ') and not lines[di].startswith('static inline'); lines[di] = 'static inline ' + lines[di][7:]
+    if g['fn'] in exp:
+        assert lines[di].startswith('static '); lines[di] = lines[di][7:]
+        sig = []
+        for l in lines[di:]:
+            if l.strip() == '{': break
+            if l.rstrip().endswith('{'): sig.append(l.rstrip()[:-1].rstrip()); break
+            sig.append(l)
+        protos.append(renamed('\n'.join(sig)) + ';')
+    lines = [l for l in lines if not proto_re.match(l)]
+    seg = renamed('\n'.join(lines)).strip('\n')
     f = names[g['target']]
-    body = norm(rest[f])
-    if seg and seg not in body:
-        bad += 1; print('MISSING', g['from'], g['to'], f)
-    else:
-        i = body.find(seg)
-        rest[f] = body[:i] + body[i + len(seg):]
+    i = new[f].find(seg, pos[f]) if seg else pos[f]
+    if i < 0: bad += 1; print('MISSING or out of order', g['from'], g['to'], f); continue
+    spans[f].append((i, i + len(seg))); pos[f] = i + len(seg)
 missing = [i for i in range(54, len(orig) + 1) if i not in cover]
+lic = '\n'.join(orig[:16]); inc = '\n'.join(orig[16:53]).strip('\n')
+for f, s in new.items():
+    for a, b in reversed(spans[f]): s = s[:a] + s[b:]
+    s = s.replace(lic, '', 1)
+    if f == 'vo_avfoundation_priv.h':
+        assert inc in s, 'include block changed'; s = s.replace(inc, '', 1)
+        s = s.replace('// Shared by the vo_avfoundation*.m / avfoundation_*.m files: state, options, small\n'
+                      '// helpers and the functions one file calls in another.', '', 1).replace('#pragma once', '', 1)
+        for pr in protos:
+            assert s.count(pr) == 1, 'declaration missing: ' + pr[:60]; s = s.replace(pr, '', 1)
+    else:
+        s = s.replace('#include "vo_avfoundation_priv.h"', '', 1)
+    extra = [l for l in s.split('\n') if l.strip()]
+    print(f, 'extra lines:', extra[:8] or 'none'); bad += bool(extra)
 print('uncovered original lines:', missing[:10] or 'none')
-lic = '\n'.join(orig[:16])
-for f, s in rest.items():
-    s = s.replace(norm(lic), '')
-    s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
-    left = [l for l in s.split('\n') if l.strip() and not re.match(r'\s*(#|//|@class)', l)]
-    # 函数声明：多行签名合起来以 ; 结尾
-    text = '\n'.join(left)
-    text = re.sub(r'[^;{}]*?\b(%s)\s*\([^;{}]*\);' % '|'.join(map(re.escape, plan['exported'].values())), '', text, flags=re.S)
-    extra = [l for l in text.split('\n') if l.strip()]
-    print(f, 'extra lines:', extra[:8] or 'none')
-    bad += bool(extra)
 print('RESULT', 'OK' if not bad and not missing else 'FAIL')
