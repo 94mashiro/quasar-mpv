@@ -19,6 +19,11 @@
  * Abstractions on the CoreAudio API to make property setting/getting suck less
 */
 
+#include <TargetConditionals.h>
+// CoreAudio HAL property access: macOS only. iOS/tvOS avfoundation AO needs
+// no device-property API.
+#if !TARGET_OS_IPHONE
+
 #include "audio/out/ao_coreaudio_properties.h"
 #include "audio/out/ao_coreaudio_utils.h"
 #include "mpv_talloc.h"
@@ -101,3 +106,5 @@ Boolean ca_settable(AudioObjectID id, ca_scope scope, ca_sel selector,
 
     return AudioObjectIsPropertySettable(id, &p_addr, data);
 }
+
+#endif // !TARGET_OS_IPHONE

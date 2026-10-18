@@ -206,10 +206,10 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
     return self;
 }
 - (void)handleRestartNotification:(NSNotification*)notification {
-    char *name = cfstr_get_cstr((CFStringRef)notification.name);
+    // Use portable NSString -UTF8String; cfstr_get_cstr lives in macOS-only
+    // osdep/utils-mac.c.
     MP_WARN(ao, "restarting due to system notification; this will cause desync\n");
-    MP_VERBOSE(ao, "notification name: %s\n", name);
-    talloc_free(name);
+    MP_VERBOSE(ao, "notification name: %s\n", notification.name.UTF8String);
     stop(ao);
     start(ao);
 }
@@ -249,9 +249,12 @@ static int init(struct ao *ao)
         goto error;
     }
 
+#if !TARGET_OS_IPHONE
+    // Device selection: macOS only. iOS/tvOS use fixed output.
     if (ao->device && ao->device[0]) {
         [p->renderer setAudioOutputDeviceUniqueID:(NSString*)cfstr_from_cstr(ao->device)];
     }
+#endif
 
     [p->synchronizer addRenderer:p->renderer];
 #if HAVE_MACOS_11_3_FEATURES
@@ -362,6 +365,8 @@ const struct ao_driver audio_out_avfoundation = {
     .reset          = stop,
     .start          = start,
     .set_pause      = set_pause,
+#if !TARGET_OS_IPHONE
     .list_devs      = ca_get_device_list,
+#endif
     .priv_size      = sizeof(struct priv),
 };
