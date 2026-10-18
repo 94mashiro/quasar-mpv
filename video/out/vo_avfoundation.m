@@ -36,6 +36,8 @@
 #include "sub/osd.h"
 #include "avfoundation_color.h"
 #include "avfoundation_hdr10plus.h"
+#include "avfoundation_vivid.h"
+#include <libavutil/hdr_dynamic_vivid_metadata.h>
 
 #import <CoreMedia/CoreMedia.h>
 #import <AVFoundation/AVFoundation.h>
@@ -84,6 +86,7 @@ struct avfoundation_opts {
     int osd_max_height;
     double subtitle_luminance;
     double subtitle_edr_gain;
+    double vivid_peak;
     bool osd_video_res;
     int osd_layer;
 };
@@ -410,6 +413,25 @@ struct priv {
     int dovi_validated_state;
     int hdr10plus_state;
     struct voctrl_native_video_statistics video_statistics;
+
+    // HDR Vivid mapping (avfoundation_vivid.h). The LUT is rebuilt only when
+    // the frame's metadata or the target changes.
+    id<MTLDevice> vividDevice;
+    id<MTLCommandQueue> vividQueue;
+    id<MTLComputePipelineState> vividPipeline;
+    id<MTLBuffer> vividLut;
+    CVMetalTextureCacheRef vividTextureCache;
+    CVPixelBufferPoolRef vividPool;
+    CVPixelBufferPoolRef vividReservePool;
+    int vivid_pool_w, vivid_pool_h;
+    OSType vivid_pool_format;
+    bool vivid_setup_failed;
+    bool vivid_lut_valid;
+    struct avf_vivid_raw vivid_raw;
+    double vivid_lut_peak, vivid_lut_mastering;
+    bool vivid_lut_full;
+    struct avf_vivid_uniforms vivid_uniforms;
+    int vivid_state;
 
     // Log resized-composite rejection once.
     bool composite_size_mismatch_logged;
@@ -3677,6 +3699,251 @@ static bool validate_native_dovi_frame(struct vo *vo, struct mp_image *mpi,
     return true;
 }
 
+enum {
+    AVF_VIVID_ABSENT = 0,
+    AVF_VIVID_ACTIVE,
+    AVF_VIVID_SKIPPED_DOVI,
+    AVF_VIVID_SKIPPED_FORMAT,
+    AVF_VIVID_UNSUPPORTED,
+    AVF_VIVID_FAILED,
+};
+
+static void release_vivid(struct priv *p)
+{
+    [p->vividPipeline release];
+    p->vividPipeline = nil;
+    [p->vividQueue release];
+    p->vividQueue = nil;
+    [p->vividLut release];
+    p->vividLut = nil;
+    if (p->vividTextureCache) {
+        CFRelease(p->vividTextureCache);
+        p->vividTextureCache = NULL;
+    }
+    if (p->vividPool) {
+        CVPixelBufferPoolRelease(p->vividPool);
+        p->vividPool = NULL;
+    }
+    if (p->vividReservePool) {
+        CVPixelBufferPoolRelease(p->vividReservePool);
+        p->vividReservePool = NULL;
+    }
+    [p->vividDevice release];
+    p->vividDevice = nil;
+    p->vivid_lut_valid = false;
+}
+
+static bool ensure_vivid(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+
+    if (p->vividPipeline)
+        return true;
+    if (p->vivid_setup_failed)
+        return false;
+    p->vivid_setup_failed = true;
+    p->vividDevice = MTLCreateSystemDefaultDevice();
+    if (!p->vividDevice)
+        return false;
+    NSError *err = nil;
+    id<MTLLibrary> lib = [p->vividDevice newLibraryWithSource:@(avf_vivid_metal_source)
+                                                      options:nil error:&err];
+    id<MTLFunction> fn = [lib newFunctionWithName:@"vivid_map"];
+    if (fn)
+        p->vividPipeline = [p->vividDevice newComputePipelineStateWithFunction:fn error:&err];
+    [fn release];
+    [lib release];
+    if (!p->vividPipeline) {
+        MP_ERR(vo, "HDR Vivid kernel failed: %s\n", err.localizedDescription.UTF8String);
+        release_vivid(p);
+        return false;
+    }
+    p->vividQueue = [p->vividDevice newCommandQueue];
+    p->vividLut = [p->vividDevice newBufferWithLength:sizeof(float) * AVF_VIVID_LUT_SIZE
+                                              options:MTLResourceStorageModeShared];
+    if (!p->vividQueue || !p->vividLut ||
+        CVMetalTextureCacheCreate(NULL, NULL, p->vividDevice, NULL,
+                                  &p->vividTextureCache) != kCVReturnSuccess) {
+        release_vivid(p);
+        return false;
+    }
+    p->vivid_setup_failed = false;
+    return true;
+}
+
+static struct avf_vivid_raw vivid_raw_from_av(const AVDynamicHDRVivid *v)
+{
+    const AVHDRVividColorTransformParams *w = &v->params[0];
+    struct avf_vivid_raw r = {
+        .min = w->minimum_maxrgb.num, .avg = w->average_maxrgb.num,
+        .var = w->variance_maxrgb.num, .max = w->maximum_maxrgb.num,
+        .tm_flag = w->tone_mapping_mode_flag, .tm_num = w->tone_mapping_param_num,
+        .sat_flag = w->color_saturation_mapping_flag, .sat_num = w->color_saturation_num,
+    };
+    for (int i = 0; i < 2; i++) {
+        const AVHDRVividColorToneMappingParams *t = &w->tm_params[i];
+        r.tm[i] = (struct avf_vivid_raw_tm){
+            .target = t->targeted_system_display_maximum_luminance.num,
+            .base_flag = t->base_enable_flag,
+            .m_p = t->base_param_m_p.num, .m_m = t->base_param_m_m.num,
+            .m_a = t->base_param_m_a.num, .m_b = t->base_param_m_b.num,
+            .m_n = t->base_param_m_n.num, .k1 = t->base_param_k1, .k2 = t->base_param_k2,
+            .k3 = t->base_param_k3, .dmode = t->base_param_Delta_enable_mode,
+            .delta = t->base_param_Delta.num,
+            .spline_flag = t->three_Spline_enable_flag, .spline_num = t->three_Spline_num,
+        };
+        for (int j = 0; j < 2; j++) {
+            const AVHDRVivid3SplineParams *sp = &t->three_spline[j];
+            r.tm[i].spline[j] = (struct avf_vivid_raw_spline){sp->th_mode, sp->th_enable_mb.num,
+                sp->th_enable.num, sp->th_delta1.num, sp->th_delta2.num, sp->enable_strength.num};
+        }
+    }
+    for (int i = 0; i < 8; i++)
+        r.sat_gain[i] = w->color_saturation_gain[i].num;
+    return r;
+}
+
+static bool vivid_texture(struct priv *p, CVPixelBufferRef buf, int plane,
+                          MTLPixelFormat format, CVMetalTextureRef *out)
+{
+    return CVMetalTextureCacheCreateTextureFromImage(NULL, p->vividTextureCache, buf, NULL,
+        format, CVPixelBufferGetWidthOfPlane(buf, plane),
+        CVPixelBufferGetHeightOfPlane(buf, plane), plane, out) == kCVReturnSuccess;
+}
+
+static int run_vivid(struct vo *vo, mp_image_t *mpi, CVPixelBufferRef src,
+                     const AVDynamicHDRVivid *v, CVPixelBufferRef *out)
+{
+    struct priv *p = vo->priv;
+
+    if (!ensure_vivid(vo))
+        return AVF_VIVID_FAILED;
+    struct avf_vivid_raw raw = vivid_raw_from_av(v);
+    double peak = p->opts->vivid_peak, mastering = mpi->params.color.hdr.max_luma;
+    OSType format = CVPixelBufferGetPixelFormatType(src);
+    bool full = is_full_range_yuv_format(format);
+    if (memcmp(&raw, &p->vivid_raw, sizeof(raw)) || peak != p->vivid_lut_peak ||
+        mastering != p->vivid_lut_mastering || full != p->vivid_lut_full) {
+        struct avf_vivid_curve c;
+        p->vivid_lut_valid = avf_vivid_curve_init(&c, &raw, peak, mastering) &&
+            avf_vivid_prepare(&c, &raw, full, p->vividLut.contents, &p->vivid_uniforms);
+        p->vivid_raw = raw;
+        p->vivid_lut_peak = peak;
+        p->vivid_lut_mastering = mastering;
+        p->vivid_lut_full = full;
+        if (p->vivid_lut_valid)
+            MP_DBG(vo, "HDR Vivid curve: peak=%.0f mastering=%.0f m_p=%.4f m_m=%.3f "
+                     "m_a=%.4f m_b=%.4f TH3=%.4f splines=%d map(1)=%.4f\n", peak, mastering,
+                     c.m_p, c.m_m, c.m_a, c.m_b, c.TH30, c.n_iv, avf_vivid_map(&c, 1.0));
+    }
+    if (!p->vivid_lut_valid)
+        return AVF_VIVID_UNSUPPORTED;
+
+    int w = (int)CVPixelBufferGetWidth(src), h = (int)CVPixelBufferGetHeight(src);
+    CVPixelBufferRef dst = NULL;
+    if (!create_pixel_buffer_pool(vo, &p->vividPool, &p->vivid_pool_w, &p->vivid_pool_h,
+                                  &p->vivid_pool_format, w, h, format, "HDR Vivid"))
+        return AVF_VIVID_FAILED;
+    CVReturn status = avf_pool_get_buffer_for_frame(vo, p->vividPool, &p->vividReservePool, &dst);
+    // Mapping runs on the VO thread close to the frame's deadline, so at 4K60
+    // there is no time left to wait for the layer to recycle a buffer; a few
+    // extra buffers keep the frame mapped instead of showing it unmapped.
+    if (status == kCVReturnWouldExceedAllocationThreshold) {
+        int limit = avf_presentation_pool_limit(p->opts->queue_lead_ms,
+            p->pool_frame_duration_ns, p->presentation_host) + 4;
+        status = avf_pool_get_buffer_with_limit(p->vividPool,
+            MPMIN(limit, AVF_POOL_MAX_BUFFERS), &dst);
+    }
+    // Failure reasons are logged once per run of failures, like the state.
+    bool log_failure = p->vivid_state != AVF_VIVID_FAILED;
+    if (status != kCVReturnSuccess) {
+        if (log_failure)
+            MP_WARN(vo, "HDR Vivid: no output buffer: %d\n", status);
+        return AVF_VIVID_FAILED;
+    }
+
+    CVMetalTextureRef tex[4] = {0};
+    bool ok = vivid_texture(p, src, 0, MTLPixelFormatR16Unorm, &tex[0]) &&
+              vivid_texture(p, src, 1, MTLPixelFormatRG16Unorm, &tex[1]) &&
+              vivid_texture(p, dst, 0, MTLPixelFormatR16Unorm, &tex[2]) &&
+              vivid_texture(p, dst, 1, MTLPixelFormatRG16Unorm, &tex[3]);
+    if (ok) {
+        // ponytail: waits for the GPU on the VO thread; a ring of in-flight
+        // frames if 4K60 misses its deadline.
+        id<MTLCommandBuffer> cmd = [p->vividQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:p->vividPipeline];
+        for (int i = 0; i < 4; i++)
+            [enc setTexture:CVMetalTextureGetTexture(tex[i]) atIndex:i];
+        [enc setBytes:&p->vivid_uniforms length:sizeof(p->vivid_uniforms) atIndex:0];
+        [enc setBuffer:p->vividLut offset:0 atIndex:1];
+        NSUInteger tw = p->vividPipeline.threadExecutionWidth;
+        NSUInteger th = MPMAX(p->vividPipeline.maxTotalThreadsPerThreadgroup / tw, 1);
+        [enc dispatchThreads:MTLSizeMake(CVPixelBufferGetWidthOfPlane(src, 1),
+                                         CVPixelBufferGetHeightOfPlane(src, 1), 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        ok = cmd.status == MTLCommandBufferStatusCompleted;
+        if (!ok && log_failure)
+            MP_WARN(vo, "HDR Vivid: GPU command failed: %s\n", cmd.error.localizedDescription.UTF8String);
+    } else if (log_failure) {
+        MP_WARN(vo, "HDR Vivid: Metal texture failed\n");
+    }
+    for (int i = 0; i < 4; i++) {
+        if (tex[i])
+            CFRelease(tex[i]);
+    }
+    if (!ok) {
+        CVPixelBufferRelease(dst);
+        return AVF_VIVID_FAILED;
+    }
+
+    // The output is HDR10 mastered for this display, so the system should not
+    // tone map it again. Pooled buffers keep the last frame's attachments.
+    CVBufferRemoveAllAttachments(dst);
+    CVBufferPropagateAttachments(src, dst);
+    struct pl_color_space color = mpi->params.color;
+    if (color.hdr.prim.red.x <= 0)
+        color.hdr.prim = *pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+    if (color.hdr.prim.white.x <= 0)
+        color.hdr.prim.white = pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020)->white;
+    color.hdr.max_luma = peak;
+    color.hdr.min_luma = MPMIN(color.hdr.min_luma, peak / 2);
+    color.hdr.max_cll = peak;
+    color.hdr.max_fall = 0;
+    avf_set_static_hdr_metadata(dst, &color);
+    *out = dst;
+    return AVF_VIVID_ACTIVE;
+}
+
+// Returns an owned P010 frame mapped for the display, or NULL to keep src.
+static CVPixelBufferRef map_vivid_frame(struct vo *vo, mp_image_t *mpi, CVPixelBufferRef src)
+{
+    struct priv *p = vo->priv;
+
+    const AVDynamicHDRVivid *v = NULL;
+    for (int i = 0; i < mpi->num_ff_side_data && p->opts->vivid_peak > 0; i++) {
+        if (mpi->ff_side_data[i].type == AV_FRAME_DATA_DYNAMIC_HDR_VIVID &&
+            mpi->ff_side_data[i].buf->size >= sizeof(*v))
+            v = (const AVDynamicHDRVivid *)mpi->ff_side_data[i].buf->data;
+    }
+    CVPixelBufferRef out = NULL;
+    int state = !v ? AVF_VIVID_ABSENT
+        : CVBufferGetAttachment(src, CFSTR("DolbyVisionRPUData"), NULL) ? AVF_VIVID_SKIPPED_DOVI
+        : !is_p010_format(CVPixelBufferGetPixelFormatType(src)) ||
+          mpi->params.color.transfer != PL_COLOR_TRC_PQ ? AVF_VIVID_SKIPPED_FORMAT
+        : run_vivid(vo, mpi, src, v, &out);
+    if (state != p->vivid_state) {
+        const char *states[] = {"absent", "active", "skipped-dolby-vision", "skipped-not-pq-p010",
+                                "unsupported-metadata", "failed"};
+        MP_INFO(vo, "MPVUI_NATIVE_VIVID: %s (peak %.0f nits)\n", states[state], p->opts->vivid_peak);
+        p->vivid_state = state;
+    }
+    return out;
+}
+
 static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *mpi)
 {
     @autoreleasepool {
@@ -3704,9 +3971,19 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
             p->video_statistics.pixel_buffer_copies++;
         }
 
+        // HDR Vivid: map before subtitles and geometry draw on the frame.
+        CVPixelBufferRef vivid = map_vivid_frame(vo, mpi, pixbuf);
+        if (vivid) {
+            if (pixbufNeedsRelease)
+                CVPixelBufferRelease(pixbuf);
+            pixbuf = vivid;
+            pixbufNeedsRelease = true;
+            p->video_statistics.pixel_buffer_copies++;
+        }
+
         CVPixelBufferRef finalBuffer = pixbuf;
         bool needsRelease = false;
-        bool pixels_transformed = false;
+        bool pixels_transformed = vivid != NULL;
 
         bool applyGeometry = should_apply_video_geometry(vo);
         // Native dvh1 RPU describes untouched frames. Core Image redraw
@@ -4162,7 +4439,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
     MP_VERBOSE(vo, "reconfig: %dx%d\n", params->w, params->h);
     struct priv *p = vo->priv;
-    p->dovi_validated_state = p->hdr10plus_state = 0;
+    p->dovi_validated_state = p->hdr10plus_state = p->vivid_state = 0;
     p->video_statistics = (struct voctrl_native_video_statistics){0};
     p->dovi_unsupported_logged = false;
     clear_sw_upload_metadata(p);
@@ -4233,6 +4510,7 @@ static void uninit(struct vo *vo)
     if (p->video_format_attachments) CFRelease(p->video_format_attachments);
     p->video_format_attachments = NULL;
     release_ci_compositor(p);
+    release_vivid(p);
 
     [p->displayLayer release];
     p->displayLayer = nil;
@@ -4349,6 +4627,9 @@ static const struct m_option avfoundation_options[] = {
     // Subtitle layer brightness relative to SDR white (HDR subtitle
     // exposure); > 1 turns on EDR for that layer.
     {"subtitle-edr-gain", OPT_DOUBLE(subtitle_edr_gain), M_RANGE(0, 2)},
+    // HDR Vivid: map frames with T/UWA 005.1 metadata to this display peak
+    // in nits; 0 leaves them to the system as HDR10.
+    {"vivid-peak", OPT_DOUBLE(vivid_peak), M_RANGE(0, 10000)},
     // Rasterize at video pixel density: 1:1 over displayed video rect.
     {"osd-video-res", OPT_BOOL(osd_video_res)},
     {0},
