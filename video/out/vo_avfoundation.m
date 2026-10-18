@@ -328,8 +328,8 @@ struct priv {
     CVPixelBufferPoolRef outputPool;
     int output_pool_w, output_pool_h;
     OSType output_pool_format;
-    CGImageRef cachedSubtitleImage;
     CVPixelBufferRef cachedSubtitleBuffer;
+    struct avf_subtitle_image_cache subtitleImageCache;
     int subtitle_x0, subtitle_y0, subtitle_x1, subtitle_y1;
     bool has_subtitle;
 
@@ -2403,7 +2403,6 @@ static bool render_osd_with_geometry(struct vo *vo, double pts,
         bounds.x1 = MPMAX(bounds.x1, p->subtitle_x1);
         bounds.y1 = MPMAX(bounds.y1, p->subtitle_y1);
     }
-    p->cachedSubtitleImage = CGBitmapContextCreateImage(cg);
     CGContextRelease(cg);
     CVPixelBufferUnlockBaseAddress(buf, 0);
     p->cachedSubtitleBuffer = buf;
@@ -2466,6 +2465,7 @@ static bool ensure_ci_compositor(struct vo *vo)
 
 static void release_ci_compositor(struct priv *p)
 {
+    avf_subtitle_image_cache_clear(&p->subtitleImageCache);
     [p->ciContext release];
     p->ciContext = nil;
     [p->mtlDevice release];
@@ -2519,7 +2519,7 @@ static CIImage *subtitle_ci_image(struct vo *vo, CVPixelBufferRef videoBuffer)
         return nil;
     }
     struct avf_overlay_color color = get_overlay_color(vo, videoBuffer);
-    return avf_subtitle_image(sub, cs, &color);
+    return avf_cached_subtitle_image(&p->subtitleImageCache, sub, cs, &color);
 }
 
 static CVPixelBufferRef composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
@@ -3453,10 +3453,7 @@ static int query_format(struct vo *vo, int format)
 
 static void clear_subtitle_cache(struct priv *p)
 {
-    if (p->cachedSubtitleImage) {
-        CGImageRelease(p->cachedSubtitleImage);
-        p->cachedSubtitleImage = NULL;
-    }
+    avf_subtitle_image_cache_clear(&p->subtitleImageCache);
     if (p->cachedSubtitleBuffer) {
         CVPixelBufferRelease(p->cachedSubtitleBuffer);
         p->cachedSubtitleBuffer = NULL;
@@ -3511,15 +3508,7 @@ static void uninit(struct vo *vo)
         p->timebase = NULL;
     }
 
-    if (p->cachedSubtitleImage) {
-        CGImageRelease(p->cachedSubtitleImage);
-        p->cachedSubtitleImage = NULL;
-    }
-
-    if (p->cachedSubtitleBuffer) {
-        CVPixelBufferRelease(p->cachedSubtitleBuffer);
-        p->cachedSubtitleBuffer = NULL;
-    }
+    clear_subtitle_cache(p);
 
     if (p->outputPool) {
         CVPixelBufferPoolRelease(p->outputPool);
@@ -3544,10 +3533,7 @@ static void uninit(struct vo *vo)
 
     if (p->video_format_attachments) CFRelease(p->video_format_attachments);
     p->video_format_attachments = NULL;
-    [p->ciContext release];
-    p->ciContext = nil;
-    [p->mtlDevice release];
-    p->mtlDevice = nil;
+    release_ci_compositor(p);
 
     [p->displayLayer release];
     p->displayLayer = nil;

@@ -231,6 +231,8 @@ static inline CIImage *avf_subtitle_image(CVPixelBufferRef sub, CGColorSpaceRef 
     for (size_t y = 0; y < height; y++) {
         for (size_t x = 0; x < width; x++) {
             const uint8_t *bgra = base + y * stride + x * 4;
+            // NSMutableData starts zeroed; transparent canvas needs no color math.
+            if (!bgra[3]) continue;
             double rgb[3];
             avf_subtitle_nits(color, bgra, rgb);
             avf_from_nits(color->transfer, rgb, color->kr, color->kb);
@@ -243,5 +245,65 @@ static inline CIImage *avf_subtitle_image(CVPixelBufferRef sub, CGColorSpaceRef 
     CVPixelBufferUnlockBaseAddress(sub, kCVPixelBufferLock_ReadOnly);
     return [CIImage imageWithBitmapData:pixels bytesPerRow:width * 4 * sizeof(float)
                                  size:CGSizeMake(width, height) format:kCIFormatRGBAf colorSpace:cs];
+}
+
+// Owned by the VO thread. The caller keeps the source bitmap immutable until
+// invalidation; retaining it prevents address reuse from aliasing another cue.
+struct avf_subtitle_image_cache {
+    CIImage *image;
+    CVPixelBufferRef source;
+    CGColorSpaceRef color_space;
+    struct avf_overlay_color color;
+};
+
+static inline void avf_subtitle_image_cache_clear(struct avf_subtitle_image_cache *cache)
+{
+    [cache->image release];
+    if (cache->source) CVPixelBufferRelease(cache->source);
+    if (cache->color_space) CGColorSpaceRelease(cache->color_space);
+    *cache = (struct avf_subtitle_image_cache){0};
+}
+
+static inline bool avf_overlay_color_equal(const struct avf_overlay_color *a,
+                                            const struct avf_overlay_color *b)
+{
+    // Compare semantic fields: the C structure can contain padding bytes.
+    if (a->transfer != b->transfer || a->white_nits != b->white_nits ||
+        a->kr != b->kr || a->kb != b->kb)
+        return false;
+    for (int row = 0; row < 3; row++) {
+        for (int col = 0; col < 3; col++) {
+            if (a->rgb_matrix[row][col] != b->rgb_matrix[row][col]) return false;
+        }
+    }
+    return true;
+}
+
+// Returns a borrowed image, valid until the next cache change. Repeated video
+// frames reuse the converted float canvas while the cue and output color agree.
+static inline CIImage *avf_cached_subtitle_image(struct avf_subtitle_image_cache *cache,
+                                                CVPixelBufferRef sub, CGColorSpaceRef cs,
+                                                const struct avf_overlay_color *color)
+{
+    if (!sub || !cs || !color) {
+        avf_subtitle_image_cache_clear(cache);
+        return nil;
+    }
+    if (cache->image && cache->source == sub &&
+        CFEqual(cache->color_space, cs) &&
+        avf_overlay_color_equal(&cache->color, color))
+        return cache->image;
+
+    // Retain inputs before clearing: callers may reuse the cache's own source.
+    CVPixelBufferRetain(sub);
+    CGColorSpaceRetain(cs);
+    struct avf_overlay_color next_color = *color;
+    avf_subtitle_image_cache_clear(cache);
+    cache->source = sub;
+    cache->color_space = cs;
+    cache->color = next_color;
+    cache->image = [avf_subtitle_image(sub, cs, &next_color) retain];
+    if (!cache->image) avf_subtitle_image_cache_clear(cache);
+    return cache->image;
 }
 #endif
