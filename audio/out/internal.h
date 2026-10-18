@@ -32,7 +32,10 @@ struct ao {
     int sstride;                // size of a sample on each plane
                                 // (format_size*num_channels/num_planes)
     int num_planes;
-    bool probing;               // if true, don't fail loudly on init
+    bool probing;               // true: quiet init failure
+    // Pull AO publishes actual device clock and drain state; set during init.
+    bool device_clock;
+    bool drain_before_gapless;  // finite epochs cannot overlap files
     bool untimed;               // don't assume realtime playback
     int device_buffer;          // device buffer in samples (guessed by
                                 // common init code if not set by driver)

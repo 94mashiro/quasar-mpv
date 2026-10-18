@@ -195,7 +195,7 @@ AudioChannelLabel mp_speaker_id_to_ca_label(int speaker_id)
     return -1; // kAudioChannelLabel_Unknown
 }
 
-#if HAVE_COREAUDIO || HAVE_AVFOUNDATION
+#if HAVE_COREAUDIO || HAVE_AUDIOUNIT || HAVE_AVFOUNDATION
 void ca_log_layout(struct ao *ao, int l, AudioChannelLayout *layout)
 {
     if (!mp_msg_test(ao->log, l))
@@ -339,6 +339,9 @@ AudioChannelLayout *ca_get_acl(struct ao *ao, size_t *out_layout_size)
 }
 
 
+#endif
+
+#if HAVE_COREAUDIO
 #define CHMAP(n, ...) &(struct mp_chmap) MP_CONCAT(MP_CHMAP, n) (__VA_ARGS__)
 
 // Replace each channel in a with b (a->num == b->num)
@@ -405,9 +408,6 @@ coreaudio_error:
     return false;
 }
 
-#if !TARGET_OS_IPHONE
-// CoreAudio HAL helpers (AudioObject*/AudioDeviceID): macOS only. iOS/tvOS
-// lack device selection and these APIs.
 static AudioChannelLayout* ca_query_layout(struct ao *ao,
                                            AudioDeviceID device,
                                            void *talloc_ctx)
@@ -535,5 +535,4 @@ void ca_get_active_chmap(struct ao *ao, AudioDeviceID device, int channel_count,
     MP_WARN(ao, "mismatching channels - falling back to %s\n",
             mp_chmap_to_str(out_map));
 }
-#endif // device HAL (!TARGET_OS_IPHONE)
 #endif

@@ -384,6 +384,13 @@ void ao_request_reload(struct ao *ao)
     ao_add_events(ao, AO_EVENT_RELOAD);
 }
 
+// Request PCM for this player's failing compressed stream. Core owns decoder;
+// AO sends thread-safe per-instance event.
+void ao_request_pcm_fallback(struct ao *ao)
+{
+    ao_add_events(ao, AO_EVENT_RELOAD | AO_EVENT_PCM_FALLBACK);
+}
+
 // Notify the player that the device list changed. Fully thread-safe.
 void ao_hotplug_event(struct ao *ao)
 {
@@ -448,6 +455,11 @@ const char *ao_get_name(struct ao *ao)
 const char *ao_get_description(struct ao *ao)
 {
     return ao->driver->description;
+}
+
+bool ao_needs_drain_before_gapless(struct ao *ao)
+{
+    return ao->drain_before_gapless;
 }
 
 bool ao_untimed(struct ao *ao)

@@ -61,6 +61,12 @@ struct buffer_state {
     bool paused;                // logically paused
     bool hw_paused;             // driver->set_pause() was used successfully
 
+    // Opt-in device clock under lock; may freeze during preroll/stalls unlike
+    // predicted callback-end timestamps.
+    int64_t device_delay_ns;
+    int64_t device_clock_time_ns;
+    double device_clock_rate;
+
     int64_t end_time_ns;        // absolute output time of last played sample
     int64_t queued_time_ns;     // duration of samples that have been queued to
                                 // the device but have not been played.
@@ -175,6 +181,46 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
     return pos;
 }
 
+// --- native pull clock core
+// Hold buffer lock. Stopped AO cannot expose old-epoch delay; paused/parked
+// clock cannot drain via wall-time extrapolation.
+static int64_t device_clock_delay(struct buffer_state *p, int64_t now)
+{
+    if (!p->playing)
+        return 0;
+    int64_t elapsed = p->paused ? 0 : MPMAX(now - p->device_clock_time_ns, 0);
+    int64_t played = elapsed * p->device_clock_rate;
+    return MPMAX(p->device_delay_ns - played, 0);
+}
+
+// Publish only on serialized driver queue. Never call driver under buffer
+// lock: reset/pause may wait on that queue. Only ao_start() restores playing,
+// so stale callback cannot undo seek/reset.
+void ao_update_streaming_clock(struct ao *ao, int64_t delay_ns,
+                               double clock_rate, bool playing)
+{
+    struct buffer_state *p = ao->buffer_state;
+    bool wakeup = false;
+    mp_mutex_lock(&p->lock);
+    if (ao->device_clock && p->playing) {
+        p->device_delay_ns = MPMAX(delay_ns, 0);
+        p->device_clock_time_ns = mp_time_ns();
+        p->device_clock_rate = isfinite(clock_rate) ? MPCLAMP(clock_rate, 0, 4) : 0;
+        if (!playing) {
+            p->playing = false;
+            p->streaming = false;
+            p->device_delay_ns = 0;
+            p->device_clock_rate = 0;
+            mp_cond_broadcast(&p->wakeup);
+            wakeup = true;
+        }
+    }
+    mp_mutex_unlock(&p->lock);
+    if (wakeup)
+        ao->wakeup_cb(ao->wakeup_ctx);
+}
+// --- end native pull clock core
+
 static int ao_read_data_locked(struct ao *ao, void **data, int samples,
                                int64_t out_time_ns, bool *eof, bool pad_silence)
 {
@@ -183,10 +229,21 @@ static int ao_read_data_locked(struct ao *ao, void **data, int samples,
 
     int pos = read_buffer(ao, data, samples, eof, pad_silence);
 
-    if (pos > 0)
-        p->end_time_ns = out_time_ns;
+    if (pos > 0) {
+        if (ao->device_clock) {
+            // Transfer queue duration to device clock under read lock;
+            // queries must not lose pulled samples before next clock
+            // publication.
+            int64_t now = mp_time_ns();
+            p->device_delay_ns = device_clock_delay(p, now) +
+                (int64_t)pos * MP_TIME_S_TO_NS(1) / ao->samplerate;
+            p->device_clock_time_ns = now;
+        } else {
+            p->end_time_ns = out_time_ns;
+        }
+    }
 
-    if (pos < samples && p->playing && !p->paused) {
+    if (!ao->device_clock && pos < samples && p->playing && !p->paused) {
         p->playing = false;
         ao->wakeup_cb(ao->wakeup_ctx);
         // For ao_drain().
@@ -303,6 +360,8 @@ double ao_get_delay(struct ao *ao)
         struct mp_pcm_state state;
         get_dev_state(ao, &state);
         driver_delay = state.delay;
+    } else if (ao->device_clock) {
+        driver_delay = MP_TIME_NS_TO_S(device_clock_delay(p, mp_time_ns()));
     } else {
         int64_t end = p->end_time_ns;
         int64_t now = mp_time_ns();
@@ -346,6 +405,9 @@ void ao_reset(struct ao *ao)
     p->recover_pause = false;
     p->hw_paused = false;
     p->end_time_ns = 0;
+    p->device_delay_ns = 0;
+    p->device_clock_rate = 0;
+    p->device_clock_time_ns = 0;
 
     mp_mutex_unlock(&p->lock);
 
@@ -431,6 +493,11 @@ void ao_set_paused(struct ao *ao, bool paused, bool eof)
         }
         wakeup = true;
     }
+    if (ao->device_clock && paused != p->paused) {
+        int64_t now = mp_time_ns();
+        p->device_delay_ns = device_clock_delay(p, now);
+        p->device_clock_time_ns = now;
+    }
     p->paused = paused;
 
     mp_mutex_unlock(&p->lock);
@@ -475,6 +542,11 @@ bool ao_is_playing(struct ao *ao)
 void ao_drain(struct ao *ao)
 {
     struct buffer_state *p = ao->buffer_state;
+    // Parked clock delay cannot predict wall-time drain. Allow queued audio
+    // plus bounded startup/recovery grace, even when stop/gapless teardown
+    // starves unprimed sink before source EOF.
+    int64_t device_deadline = ao->device_clock
+        ? mp_time_ns() + MP_TIME_S_TO_NS(ao_get_delay(ao) + 5.0) : 0;
 
     mp_mutex_lock(&p->lock);
     while (!p->paused && p->playing) {
@@ -482,10 +554,20 @@ void ao_drain(struct ao *ao)
         double delay = ao_get_delay(ao);
         mp_mutex_lock(&p->lock);
 
-        // Wait for buffer + arbitrary ~250ms for EOF signal from AO.
-        if (mp_cond_timedwait(&p->wakeup, &p->lock,
-                              MP_TIME_S_TO_NS(MPMAX(delay, 0) + 0.25)))
-        {
+        // Resample native clock during drain; short reads no longer signal
+        // end. Keep PCM timeout. Check absolute native deadline each
+        // iteration, including successful/spurious wakes.
+        int64_t remaining_ns = device_deadline - mp_time_ns();
+        if (ao->device_clock && remaining_ns <= 0) {
+            MP_VERBOSE(ao, "drain timeout\n");
+            break;
+        }
+        int64_t wait_ns = ao->device_clock
+            ? MPMIN(MP_TIME_MS_TO_NS(250), remaining_ns)
+            : MP_TIME_S_TO_NS(MPMAX(delay, 0) + 0.25);
+        if (mp_cond_timedwait(&p->wakeup, &p->lock, wait_ns)) {
+            if (ao->device_clock && mp_time_ns() < device_deadline)
+                continue;
             MP_VERBOSE(ao, "drain timeout\n");
             break;
         }

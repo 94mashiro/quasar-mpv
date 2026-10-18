@@ -382,12 +382,13 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
             mp_aframe_set_chmap(out_fmt, &opts->audio_output_channels.chmaps[0]);
     }
 
-    // Weak gapless audio: if the filter output format is the same as the
-    // previous one, keep the AO and don't reinit anything.
-    // Strong gapless: always keep the AO
-    if ((mpctx->ao_filter_fmt && mpctx->ao && opts->gapless_audio < 0 &&
-         keep_weak_gapless_format(mpctx->ao_filter_fmt, out_fmt)) ||
-        (mpctx->ao && opts->gapless_audio > 0))
+    // Weak gapless: reuse AO when filter format matches. Strong gapless:
+    // always reuse. Finite native items must drain/reopen per file; reuse
+    // retains old EOF and decoder timeline.
+    if (mpctx->ao && !ao_needs_drain_before_gapless(mpctx->ao) &&
+        ((mpctx->ao_filter_fmt && opts->gapless_audio < 0 &&
+          keep_weak_gapless_format(mpctx->ao_filter_fmt, out_fmt)) ||
+         opts->gapless_audio > 0))
     {
         ao_chain_set_ao(ao_c, mpctx->ao);
         talloc_free(out_fmt);
@@ -475,6 +476,9 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
                 goto init_error;
             reset_audio_state(mpctx);
             mp_output_chain_reset_harder(ao_c->filter);
+            // External pin may retain demand after reset clears internal
+            // requests. Restart source traversal.
+            mp_filter_wakeup(ao_c->filter->f);
             mp_wakeup_core(mpctx); // reinit with new format next time
             return 0;
         }
@@ -767,6 +771,7 @@ void reload_audio_output(struct MPContext *mpctx)
     if (!mpctx->ao)
         return;
 
+    bool pcm_fallback = ao_query_and_reset_events(mpctx->ao, AO_EVENT_PCM_FALLBACK);
     ao_reset(mpctx->ao);
     uninit_audio_out(mpctx);
     reinit_audio_filters(mpctx); // mostly to issue refresh seek
@@ -776,6 +781,8 @@ void reload_audio_output(struct MPContext *mpctx)
     if (ao_c) {
         reset_audio_state(mpctx);
         mp_output_chain_reset_harder(ao_c->filter);
+        // Reset does not reissue outstanding downstream demand.
+        mp_filter_wakeup(ao_c->filter->f);
     }
 
     // Whether we can use spdif might have changed. If we failed to use spdif
@@ -783,10 +790,12 @@ void reload_audio_output(struct MPContext *mpctx)
     // to PCM again if necessary).
     if (ao_c && ao_c->track) {
         struct mp_decoder_wrapper *dec = ao_c->track->dec;
-        if (dec && ao_c->spdif_failed) {
-            ao_c->spdif_passthrough = true;
-            ao_c->spdif_failed = false;
-            mp_decoder_wrapper_set_spdif_flag(ao_c->track->dec, true);
+        if (dec && (ao_c->spdif_failed || pcm_fallback)) {
+            // Async compressed failure retries decoded PCM. Other explicit
+            // reloads may retry passthrough.
+            ao_c->spdif_passthrough = !pcm_fallback;
+            ao_c->spdif_failed = pcm_fallback;
+            mp_decoder_wrapper_set_spdif_flag(ao_c->track->dec, !pcm_fallback);
             if (!mp_decoder_wrapper_reinit(dec)) {
                 MP_ERR(mpctx, "Error reinitializing audio.\n");
                 error_on_track(mpctx, ao_c->track);
@@ -969,9 +978,10 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
     }
 
     if (mpctx->audio_status == STATUS_DRAINING) {
-        // Wait until the AO has played all queued data. In the gapless case,
-        // we trigger EOF immediately, and let it play asynchronously.
-        if (!ao_c->ao || (!ao_is_playing(ao_c->ao) || opts->gapless_audio))
+        // Wait for queued audio. Gapless signals EOF immediately and drains
+        // asynchronously; finite epochs must finish before next file.
+        if (!ao_c->ao || !ao_is_playing(ao_c->ao) ||
+            (opts->gapless_audio && !ao_needs_drain_before_gapless(ao_c->ao)))
         {
             MP_VERBOSE(mpctx, "audio EOF reached\n");
             mpctx->audio_status = STATUS_EOF;

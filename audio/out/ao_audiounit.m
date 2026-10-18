@@ -109,9 +109,13 @@ static bool init_audiounit(struct ao *ao)
     AudioChannelLayout *layout = NULL;
     struct priv *p = ao->priv;
     AVAudioSession *instance = AVAudioSession.sharedInstance;
-    AVAudioSessionPortDescription *port = nil;
     NSInteger maxChannels = instance.maximumOutputNumberOfChannels;
     NSInteger prefChannels = MIN(maxChannels, ao->channels.num);
+
+    if (af_fmt_is_spdif(ao->format)) {
+        MP_FATAL(ao, "audiounit does not support spdif formats\n");
+        return false;
+    }
 
     MP_VERBOSE(ao, "max channels: %ld, requested: %d\n", maxChannels, (int)ao->channels.num);
 
@@ -163,7 +167,7 @@ static bool init_audiounit(struct ao *ao)
         MP_VERBOSE(ao, "channel map: %i: %u\n", i, layout->mChannelDescriptions[i].mChannelLabel);
     }
 
-    if (af_fmt_is_spdif(ao->format) || instance.outputNumberOfChannels <= 2) {
+    if (instance.outputNumberOfChannels <= 2) {
         ao->channels = (struct mp_chmap)MP_CHMAP_INIT_STEREO;
         MP_VERBOSE(ao, "using stereo output\n");
     } else {

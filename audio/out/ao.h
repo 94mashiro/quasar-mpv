@@ -43,6 +43,7 @@ enum aocontrol {
 enum {
     AO_EVENT_RELOAD = 1,
     AO_EVENT_HOTPLUG = 2,
+    AO_EVENT_PCM_FALLBACK = 4, // Compressed sink failed asynchronously.
 };
 
 enum {
@@ -93,6 +94,7 @@ void ao_get_format(struct ao *ao,
 const char *ao_get_name(struct ao *ao);
 const char *ao_get_description(struct ao *ao);
 bool ao_untimed(struct ao *ao);
+bool ao_needs_drain_before_gapless(struct ao *ao);
 int ao_control(struct ao *ao, enum aocontrol cmd, void *arg);
 void ao_set_gain(struct ao *ao, float gain);
 double ao_get_delay(struct ao *ao);
@@ -105,6 +107,10 @@ struct mp_async_queue;
 struct mp_async_queue *ao_get_queue(struct ao *ao);
 int ao_query_and_reset_events(struct ao *ao, int events);
 void ao_request_reload(struct ao *ao);
+void ao_request_pcm_fallback(struct ao *ao);
+// Opt-in, thread-safe pull AO clock; cannot revive reset playback.
+void ao_update_streaming_clock(struct ao *ao, int64_t delay_ns,
+                               double clock_rate, bool playing);
 void ao_hotplug_event(struct ao *ao);
 
 struct ao_hotplug;
