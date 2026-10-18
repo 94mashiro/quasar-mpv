@@ -55,6 +55,7 @@
 #include "video/out/vo.h"
 
 #include "options/m_option.h"
+#include "hwdec_recovery.h"
 
 static void init_avctx(struct mp_filter *vd);
 static void uninit_avctx(struct mp_filter *vd);
@@ -155,7 +156,7 @@ const struct m_sub_options hwdec_conf = {
         {"hwdec-image-format", OPT_IMAGEFORMAT(hwdec_image_format),
             .flags = UPDATE_VO},
         {"hwdec-software-fallback", OPT_CHOICE(software_fallback,
-            {"no", INT_MAX}, {"yes", 1}), M_RANGE(1, INT_MAX),
+            {"no", INT_MAX}, {"yes", 1}, {"auto", -1}), M_RANGE(1, INT_MAX),
             .flags = UPDATE_HWDEC},
         {"hwdec-threads", OPT_INT(hwdec_threads), M_RANGE(0, DBL_MAX)},
         {"vd-lavc-software-fallback", OPT_REPLACED("hwdec-software-fallback")},
@@ -163,7 +164,7 @@ const struct m_sub_options hwdec_conf = {
     },
     .size = sizeof(struct hwdec_opts),
     .defaults = &(const struct hwdec_opts){
-        .software_fallback = 3,
+        .software_fallback = -1, // auto; preserve explicit yes/no/N thresholds
         .hwdec_api = (char *[]){"no", NULL,},
         .hwdec_codecs = "h264,vc1,hevc,vp8,vp9,av1,prores,prores_raw,ffv1,dpx",
         // Maximum number of surfaces the player wants to buffer. This number
@@ -236,7 +237,7 @@ typedef struct lavc_ctx {
     AVBufferRef *hwdec_dev;
 
     bool hwdec_request_reinit;
-    int hwdec_fail_count;
+    struct mp_hwdec_recovery hwdec_recovery;
 
     struct mp_image_pool *hwdec_swpool;
 
@@ -882,6 +883,7 @@ static void reset_avctx(struct mp_filter *vd)
         avcodec_flush_buffers(ctx->avctx);
     ctx->flushing = false;
     ctx->hwdec_request_reinit = false;
+    mp_hwdec_recovery_reset(&ctx->hwdec_recovery);
 }
 
 static void flush_all(struct mp_filter *vd)
@@ -917,7 +919,6 @@ static void uninit_avctx(struct mp_filter *vd)
     av_buffer_unref(&ctx->hwdec_dev);
 
     ctx->hwdec_failed = false;
-    ctx->hwdec_fail_count = 0;
     ctx->max_delay_queue = 0;
     ctx->hw_probing = false;
     ctx->hwdec = (struct hwdec_info){0};
@@ -1149,6 +1150,18 @@ static void prepare_decoding(struct mp_filter *vd)
         reset_avctx(vd);
 }
 
+// Extended recovery: native AVFoundation VideoToolbox HEVC only. Other
+// codecs/APIs and Metal gpu-next keep original threshold. Honor explicit
+// yes/no/N.
+static bool can_recover_hwdec(struct mp_filter *vd)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+    return ctx->use_hwdec && !ctx->hwdec.copying && ctx->vo &&
+           strcmp(ctx->vo->driver->name, "avfoundation") == 0 &&
+           ctx->hwdec.lavc_device == AV_HWDEVICE_TYPE_VIDEOTOOLBOX &&
+           ctx->avctx && ctx->avctx->codec_id == AV_CODEC_ID_HEVC;
+}
+
 static void handle_err(struct mp_filter *vd)
 {
     vd_ffmpeg_ctx *ctx = vd->priv;
@@ -1158,9 +1171,9 @@ static void handle_err(struct mp_filter *vd)
             ctx->use_hwdec ? " (hardware decoding)" : "");
 
     if (ctx->use_hwdec) {
-        ctx->hwdec_fail_count += 1;
-        if (ctx->hwdec_fail_count >= hwdec_opts->software_fallback)
-            ctx->hwdec_failed = true;
+        ctx->hwdec_failed |= mp_hwdec_recovery_error(&ctx->hwdec_recovery,
+                                hwdec_opts->software_fallback,
+                                can_recover_hwdec(vd));
     }
 }
 
@@ -1189,8 +1202,13 @@ static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
         return ret;
 
+    // Count keyframe only after packet consumed/rejected. EAGAIN/EOF retries
+    // spend no allowance.
+    if (ctx->use_hwdec && pkt)
+        mp_hwdec_recovery_packet(&ctx->hwdec_recovery, pkt->keyframe);
+
     if (ctx->hw_probing && ctx->num_sent_packets < 32 &&
-        ctx->hwdec_opts->software_fallback <= 32)
+        mp_hwdec_fallback_threshold(ctx->hwdec_opts->software_fallback) <= 32)
     {
         pkt = pkt ? demux_copy_packet(vd->packet_pool, pkt) : NULL;
         MP_TARRAY_APPEND(ctx, ctx->sent_packets, ctx->num_sent_packets, pkt);
@@ -1264,7 +1282,13 @@ static int decode_frame(struct mp_filter *vd)
         return AVERROR_BUG;
     }
 
-    ctx->hwdec_fail_count = 0;
+    if (ctx->use_hwdec) {
+        if (ctx->hwdec_opts->software_fallback == -1 && can_recover_hwdec(vd) &&
+            ctx->hwdec_recovery.errors > 0)
+            MP_VERBOSE(vd, "Hardware decoding recovered after %d errors.\n",
+                       ctx->hwdec_recovery.errors);
+        mp_hwdec_recovery_frame(&ctx->hwdec_recovery);
+    }
 
     mpi->pts = mp_pts_from_av(ctx->pic->pts, &ctx->codec_timebase);
     mpi->dts = mp_pts_from_av(ctx->pic->pkt_dts, &ctx->codec_timebase);
@@ -1331,8 +1355,9 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
         res = sw;
         if (!res) {
             MP_ERR(vd, "Could not copy back hardware decoded frame.\n");
-            ctx->hwdec_fail_count = INT_MAX - 1; // force fallback
-            handle_err(vd);
+            // Surface-copy error cannot recover as compressed frame. Try next
+            // method immediately; selector still honors software fallback=no.
+            ctx->hwdec_failed = true;
             return AVERROR_UNKNOWN;
         }
     }
