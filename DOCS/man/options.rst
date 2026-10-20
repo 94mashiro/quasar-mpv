@@ -3018,6 +3018,11 @@ Subtitles
         This used to support fontconfig patterns. Starting with libass 0.13.0,
         this stopped working.
 
+``--sub-font-fallback=<name>``
+    Font family to use for characters the style font does not have, tried
+    before the font provider's own fallback. The default is empty, meaning
+    ``--sub-font`` itself.
+
 ``--sub-font-size=<size>``
     Specify the sub font size. The unit is the size in scaled pixels at a
     window height of 720. The actual pixel size is scaled with the window

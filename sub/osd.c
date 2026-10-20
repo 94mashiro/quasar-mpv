@@ -46,6 +46,7 @@
 #define OPT_BASE_STRUCT struct osd_style_opts
 static const m_option_t style_opts[] = {
     {"font", OPT_STRING(font)},
+    {"font-fallback", OPT_STRING(font_fallback), .flags = UPDATE_SUB_HARD},
     {"font-size", OPT_FLOAT(font_size), M_RANGE(1, 9000)},
     {"color", OPT_COLOR(color)},
     {"outline-color", OPT_COLOR(outline_color)},

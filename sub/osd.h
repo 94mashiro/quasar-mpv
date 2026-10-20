@@ -138,6 +138,7 @@ enum mp_osd_font_codepoints {
 
 struct osd_style_opts {
     char *font;
+    char *font_fallback;
     float font_size;
     struct m_color color;
     struct m_color outline_color;

@@ -98,7 +98,13 @@ void mp_ass_configure_fonts(ASS_Renderer *priv, struct osd_style_opts *opts,
         font_provider = ASS_FONTPROVIDER_FONTCONFIG;
 
     mp_verbose(log, "Setting up fonts...\n");
-    ass_set_fonts(priv, default_font, opts->font, font_provider, config, 1);
+    // Quasar: the default family is also where libass looks for glyphs the
+    // style font lacks, before asking the font provider. --sub-font-fallback
+    // lets a Latin --sub-font fall back to a CJK font the provider would not
+    // pick (CoreText answers PingFang, which FreeType cannot read on iOS).
+    char *family = opts->font_fallback && opts->font_fallback[0] ?
+                   opts->font_fallback : opts->font;
+    ass_set_fonts(priv, default_font, family, font_provider, config, 1);
     mp_verbose(log, "Done.\n");
 
     talloc_free(tmp);
