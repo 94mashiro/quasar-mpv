@@ -138,10 +138,11 @@ struct priv {
     // quantum, ~4min measurement dropped from 21/min (Plezy 2.15) or 10.6/min
     // (2s AO) to zero.
     double opt_compressed_lead;
-#if TARGET_OS_OSX
-    // PCM lookahead bound: macOS only, where slider/keyboard --volume affects
-    // software gain. iOS/tvOS hardware volume bypasses mpv; deep renderer
-    // queue supports AirPlay.
+    // PCM lookahead bound. macOS: slider/keyboard --volume is software gain
+    // baked into queued samples. All platforms: speed changes (scaletempo)
+    // are baked in too, so video runs at the new speed while queued audio
+    // still plays the old one and A/V sync holds frames until it drains.
+    // Not applied while routed to AirPlay, whose latency needs the depth.
     //
     // Limit PCM enqueue lead. Local AVSampleBufferAudioRenderer backpressure
     // measured ~1.7s; software gain is baked into queued samples, delaying
@@ -156,7 +157,6 @@ struct priv {
     // so stop timer from repeatedly checking exceeded bound.
     bool feed_enabled;
     double opt_max_lookahead;
-#endif
 };
 
 // Eligibility only: Apple still honors the user's Off/Fixed/Head Tracked choice.

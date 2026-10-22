@@ -25,8 +25,22 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
     return CMTimeMake(time, 1000000000);
 }
 
-#if TARGET_OS_OSX
 static void feed(struct ao *ao);
+
+// AirPlay's latency needs the renderer's own queue depth.
+static bool pcm_route_needs_depth(void)
+{
+#if TARGET_OS_OSX
+    return false;
+#else
+    for (AVAudioSessionPortDescription *port in
+            AVAudioSession.sharedInstance.currentRoute.outputs) {
+        if ([port.portType isEqualToString:AVAudioSessionPortAirPlay])
+            return true;
+    }
+    return false;
+#endif
+}
 
 static void pcm_request_media_data(struct ao *ao)
 {
@@ -87,7 +101,6 @@ static void pcm_set_feeding(struct ao *ao, bool enabled)
     else
         dispatch_sync(p->queue, block);
 }
-#endif  // TARGET_OS_OSX
 
 static void feed(struct ao *ao)
 {
@@ -95,15 +108,13 @@ static void feed(struct ao *ao)
     int samplerate = ao->samplerate;
     int sstride = ao->sstride;
 
-#if TARGET_OS_OSX
     if (p->pcm_lookahead_ns) {
         int64_t now = CMTimeGetNanoseconds([p->synchronizer currentTime]);
-        if (p->end_time_av - now >= p->pcm_lookahead_ns) {
+        if (p->end_time_av - now >= p->pcm_lookahead_ns && !pcm_route_needs_depth()) {
             pcm_pause_feeding(ao);
             return;
         }
     }
-#endif
 
     CMBlockBufferRef block_buffer = NULL;
     CMSampleBufferRef sample_buffer = NULL;
@@ -212,13 +223,11 @@ static void start(struct ao *ao)
 
     p->end_time_av = -1;
     [p->synchronizer setRate:1];
-#if TARGET_OS_OSX
     // Unbounded path needs no gate; retain direct initial arm.
     if (p->pcm_lookahead_ns) {
         pcm_set_feeding(ao, true);
         return;
     }
-#endif
     [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
         feed(ao);
     }];
@@ -239,11 +248,9 @@ static void stop(struct ao *ao)
         [p->renderer stopRequestingMediaData];
         [p->renderer flush];
         [p->synchronizer setRate:0];
-#if TARGET_OS_OSX
         // Frozen clock cannot drain; unschedule feed until start().
         p->feed_enabled = false;
         pcm_cancel_pending_feed(p);
-#endif
     };
     if (dispatch_get_specific(&avfoundation_queue_key) == p)
         stop_block();
@@ -288,17 +295,13 @@ static bool set_pause(struct ao *ao, bool paused)
 
     if (paused) {
         [p->synchronizer setRate:0];
-#if TARGET_OS_OSX
         // Stopped clock cannot lower queue depth; stop requests instead of
         // polling every half-bound.
         if (p->pcm_lookahead_ns)
             pcm_set_feeding(ao, false);
-#endif
     } else {
-#if TARGET_OS_OSX
         if (p->pcm_lookahead_ns)
             pcm_set_feeding(ao, true);
-#endif
         [p->synchronizer setRate:1];
     }
 
@@ -559,7 +562,6 @@ static int init(struct ao *ao)
         goto error;
     }
 
-#if TARGET_OS_OSX
     // --audio-buffer is minimum, not maximum. Use only to keep bound above
     // core's promised buffering.
     if (p->opt_max_lookahead > 0) {
@@ -585,7 +587,6 @@ static int init(struct ao *ao)
             p->pcm_lookahead_ns = 0;
         }
     }
-#endif
 
     if (ao->device && ao->device[0]) {
 #if TARGET_OS_OSX
@@ -630,8 +631,12 @@ static int init(struct ao *ao)
     talloc_free(layout);
     layout = NULL;
 
-    // AVSampleBufferAudioRenderer read ahead aggressively
-    ao->device_buffer = ao->samplerate * 2;
+    // AVSampleBufferAudioRenderer read ahead aggressively. With the queue
+    // bounded, a soft buffer of the same depth suffices; a 2 s one would
+    // hold another 2 s stretched at the old speed after a speed change.
+    ao->device_buffer = p->pcm_lookahead_ns
+        ? (int)(ao->samplerate * (p->pcm_lookahead_ns / 1e9))
+        : ao->samplerate * 2;
 
     p->observer = [[AVObserver alloc] initWithAO:ao];
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
@@ -652,13 +657,11 @@ error:
         dispatch_release(p->avp_timer);
         p->avp_timer = NULL;
     }
-#if TARGET_OS_OSX
     if (p->feed_timer) {
         dispatch_source_cancel(p->feed_timer);
         dispatch_release(p->feed_timer);
         p->feed_timer = NULL;
     }
-#endif
     if (p->loader) {
         [p->loader invalidate];
         [p->loader release];
@@ -697,7 +700,6 @@ static void uninit(struct ao *ao)
     } else {
         // stop() idled timer. Cancel on p->queue before ao_uninit() frees
         // handler's AO; no active or future handler remains.
-#if TARGET_OS_OSX
         if (p->feed_timer) {
             dispatch_sync(p->queue, ^{
                 dispatch_source_cancel(p->feed_timer);
@@ -705,7 +707,6 @@ static void uninit(struct ao *ao)
             dispatch_release(p->feed_timer);
             p->feed_timer = NULL;
         }
-#endif
         [p->renderer release];
         [p->synchronizer release];
         dispatch_release(p->queue);
@@ -735,14 +736,10 @@ const struct ao_driver audio_out_avfoundation = {
         .opt_manage_session = true,
         .opt_compressed_lead = 8,
         // Preserve PCM latency unless bound enabled.
-#if TARGET_OS_OSX
         .opt_max_lookahead = 0,
-#endif
     },
     .options = (const struct m_option[]) {
-#if TARGET_OS_OSX
         {"max-lookahead", OPT_DOUBLE(opt_max_lookahead), M_RANGE(0, 10)},
-#endif
         {"spatial-audio", OPT_CHOICE(opt_spatial_audio,
             {"no", 0}, {"multichannel", 1}, {"all", 2})},
         {"manage-audio-session", OPT_BOOL(opt_manage_session)},
