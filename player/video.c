@@ -618,7 +618,12 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
             buffered_audio = predicted + difference / opts->autosync;
         }
 
-        mpctx->time_frame = buffered_audio - mpctx->delay / mpctx->video_speed;
+        // Same as buffered_audio - delay / video_speed while all queued audio
+        // has one speed; correct while audio from before a speed change is
+        // still queued.
+        mpctx->time_frame = opts->autosync
+            ? buffered_audio - mpctx->delay / mpctx->video_speed
+            : audio_real_time_until(mpctx, written_audio_pts(mpctx) - mpctx->delay);
     } else {
         /* If we're more than 200 ms behind the right playback
          * position, don't try to speed up display of following

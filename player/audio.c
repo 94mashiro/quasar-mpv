@@ -219,6 +219,18 @@ void audio_update_volume(struct MPContext *mpctx)
 // Call this if opts->playback_speed or mpctx->speed_factor_* change.
 void update_playback_speed(struct MPContext *mpctx)
 {
+    double old_speed = mpctx->audio_speed;
+    struct ao_chain *ao_c = mpctx->ao_chain;
+    if (ao_c && ao_c->ao && ao_c->last_out_pts != MP_NOPTS_VALUE) {
+        // Queued audio keeps the speed it was stretched at. After several
+        // quick changes, treat all of it as one segment at its average speed.
+        double real = ao_get_delay(ao_c->ao);
+        double source = ao_c->last_out_pts - playing_audio_pts(mpctx);
+        ao_c->speed_before = real > 0 && source > 0 ? source / real : old_speed;
+        ao_c->speed_mark_pts = ao_c->last_out_pts;
+        MP_VERBOSE(mpctx, "Speed change with %.3f s of audio queued at %.3fx\n",
+                   real, ao_c->speed_before);
+    }
     mpctx->audio_speed = mpctx->opts->playback_speed * mpctx->speed_factor_a;
     mpctx->video_speed = mpctx->opts->playback_speed * mpctx->speed_factor_v;
 
@@ -242,6 +254,7 @@ static bool has_video_track(struct MPContext *mpctx)
 static void ao_chain_reset_state(struct ao_chain *ao_c)
 {
     ao_c->last_out_pts = MP_NOPTS_VALUE;
+    ao_c->speed_mark_pts = MP_NOPTS_VALUE;
     ao_c->out_eof = false;
     ao_c->start_pts_known = false;
     ao_c->start_pts = MP_NOPTS_VALUE;
@@ -654,12 +667,53 @@ double written_audio_pts(struct MPContext *mpctx)
 
 // Return pts value corresponding to currently playing audio adjusted for AO delay
 // and playback speed.
+// Split the audio queued in the AO into the part written before the last
+// speed change (*old_real seconds of real time, played first at
+// speed_before) and the part written after it (*new_real, at audio_speed).
+// Converting all of it with the current speed misplaces the playing position
+// by queued time * speed difference: with a deep AO queue, a 1x -> 2x change
+// held video for about a second.
+static void audio_queue_split(struct MPContext *mpctx, double *old_real,
+                              double *new_real)
+{
+    struct ao_chain *ao_c = mpctx->ao_chain;
+    double queued = ao_get_delay(mpctx->ao);
+    *old_real = 0;
+    *new_real = queued;
+    if (!ao_c || ao_c->speed_mark_pts == MP_NOPTS_VALUE)
+        return;
+    double after = (ao_c->last_out_pts - ao_c->speed_mark_pts) / mpctx->audio_speed;
+    if (after >= queued) {
+        ao_c->speed_mark_pts = MP_NOPTS_VALUE; // old audio has played out
+        return;
+    }
+    *new_real = MPMAX(after, 0);
+    *old_real = queued - *new_real;
+}
+
 double playing_audio_pts(struct MPContext *mpctx)
 {
     double pts = written_audio_pts(mpctx);
     if (pts == MP_NOPTS_VALUE || !mpctx->ao)
         return pts;
-    return pts - mpctx->audio_speed * ao_get_delay(mpctx->ao);
+    double old_real, new_real;
+    audio_queue_split(mpctx, &old_real, &new_real);
+    return pts - mpctx->audio_speed * new_real -
+           (old_real > 0 ? mpctx->ao_chain->speed_before * old_real : 0);
+}
+
+// Real time until the AO plays audio at source position pts.
+double audio_real_time_until(struct MPContext *mpctx, double pts)
+{
+    double old_real, new_real;
+    audio_queue_split(mpctx, &old_real, &new_real);
+    double distance = pts - playing_audio_pts(mpctx);
+    if (old_real <= 0)
+        return distance / mpctx->audio_speed;
+    double old_source = mpctx->ao_chain->speed_before * old_real;
+    if (distance <= old_source)
+        return distance / mpctx->ao_chain->speed_before;
+    return old_real + (distance - old_source) / mpctx->audio_speed;
 }
 
 // This garbage is needed for untimed AOs. These consume audio infinitely fast,

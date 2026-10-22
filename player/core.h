@@ -193,6 +193,10 @@ struct ao_chain {
 
     bool out_eof;
     double last_out_pts;
+    // Audio written before speed_mark_pts was stretched at speed_before and
+    // may still be queued in the AO (see audio_queue_split()).
+    double speed_mark_pts;
+    double speed_before;
 
     double start_pts;
     bool start_pts_known;
@@ -500,6 +504,7 @@ void reinit_audio_chain(struct MPContext *mpctx);
 int init_audio_decoder(struct MPContext *mpctx, struct track *track);
 int reinit_audio_filters(struct MPContext *mpctx);
 double playing_audio_pts(struct MPContext *mpctx);
+double audio_real_time_until(struct MPContext *mpctx, double pts);
 void fill_audio_out_buffers(struct MPContext *mpctx);
 double written_audio_pts(struct MPContext *mpctx);
 void clear_audio_output_buffers(struct MPContext *mpctx);
