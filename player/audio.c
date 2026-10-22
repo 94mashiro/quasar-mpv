@@ -220,8 +220,12 @@ void audio_update_volume(struct MPContext *mpctx)
 void update_playback_speed(struct MPContext *mpctx)
 {
     double old_speed = mpctx->audio_speed;
+    double new_speed = mpctx->opts->playback_speed * mpctx->speed_factor_a;
     struct ao_chain *ao_c = mpctx->ao_chain;
-    if (ao_c && ao_c->ao && ao_c->last_out_pts != MP_NOPTS_VALUE) {
+    // display-resample calls this every frame; only a real change needs a mark.
+    if (ao_c && ao_c->ao && ao_c->last_out_pts != MP_NOPTS_VALUE &&
+        fabs(new_speed - old_speed) > 1e-6)
+    {
         // Queued audio keeps the speed it was stretched at. After several
         // quick changes, treat all of it as one segment at its average speed.
         double real = ao_get_delay(ao_c->ao);
@@ -231,7 +235,7 @@ void update_playback_speed(struct MPContext *mpctx)
         MP_VERBOSE(mpctx, "Speed change with %.3f s of audio queued at %.3fx\n",
                    real, ao_c->speed_before);
     }
-    mpctx->audio_speed = mpctx->opts->playback_speed * mpctx->speed_factor_a;
+    mpctx->audio_speed = new_speed;
     mpctx->video_speed = mpctx->opts->playback_speed * mpctx->speed_factor_v;
 
     update_speed_filters(mpctx);

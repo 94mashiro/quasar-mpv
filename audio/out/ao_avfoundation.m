@@ -632,10 +632,12 @@ static int init(struct ao *ao)
     layout = NULL;
 
     // AVSampleBufferAudioRenderer read ahead aggressively. With the queue
-    // bounded, a soft buffer of the same depth suffices; a 2 s one would
-    // hold another 2 s stretched at the old speed after a speed change.
-    ao->device_buffer = p->pcm_lookahead_ns
-        ? (int)(ao->samplerate * (p->pcm_lookahead_ns / 1e9))
+    // bounded, a soft buffer of the bound plus one 0.1 s feed suffices; a 2 s
+    // one would hold another 2 s stretched at the old speed after a speed
+    // change. Without the extra feed, refills right after start can find it
+    // empty and underrun. AirPlay skips the bound, so it keeps 2 s.
+    ao->device_buffer = p->pcm_lookahead_ns && !pcm_route_needs_depth()
+        ? (int)(ao->samplerate * (p->pcm_lookahead_ns / 1e9 + 0.1))
         : ao->samplerate * 2;
 
     p->observer = [[AVObserver alloc] initWithAO:ao];
