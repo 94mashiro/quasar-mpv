@@ -642,7 +642,9 @@ static int init(struct ao *ao)
 
     p->observer = [[AVObserver alloc] initWithAO:ao];
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
-#if HAVE_MACOS_12_FEATURES
+    // The macOS SDK check is off when cross-building for iOS; the iOS SDK has
+    // it. A route change to AirPlay must reload so the soft buffer regrows.
+#if HAVE_MACOS_12_FEATURES || !TARGET_OS_OSX
     if (@available(tvOS 15.0, iOS 15.0, macOS 12.0, *)) {
         [center addObserver:p->observer selector:@selector(handleRestartNotification:) name:AVSampleBufferAudioRendererOutputConfigurationDidChangeNotification object:p->renderer];
     }
