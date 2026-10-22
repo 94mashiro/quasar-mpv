@@ -1257,6 +1257,9 @@ void write_video(struct MPContext *mpctx)
     if (opts->untimed || (vo->driver->caps & VO_CAP_UNTIMED))
         diff = -1; // disable frame dropping and aspects of frame timing
     if (diff >= 0) {
+        // Speed-unadjusted duration lets VOs that own a presentation clock
+        // read the video speed as approx_duration / duration.
+        frame->approx_duration = diff;
         diff /= mpctx->video_speed;
         frame->duration = MP_TIME_S_TO_NS(MPCLAMP(diff, 0, 10));
     }

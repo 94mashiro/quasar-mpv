@@ -127,30 +127,10 @@ struct avfoundation_opts {
 // Integral constant = 4x horizon: critical damping, poles (s + 1/(2T))^2.
 // Larger absorbs mismatch slower; smaller rings.
 #define AVF_SERVO_INTEGRAL_NS  (4 * AVF_SERVO_HORIZON_NS)
-// Average timestamp quantization over frame time. Denominator: mpv's
-// speed-adjusted frame duration. Host deadlines include audio-clock jitter,
-// stalls, and A/V corrections unrelated to playback speed.
-#define AVF_RATE_WINDOW_NS        MP_TIME_MS_TO_NS(500)
+// Plausible video speeds; outside this the frame keeps the previous rate.
 #define AVF_RATE_MIN              0.05
 #define AVF_RATE_MAX              8.0
 #define AVF_RATE_CHANGE_FRACTION  0.01
-#define AVF_RATE_FAST_FRACTION    0.04
-#define AVF_RATE_FAST_SAMPLES     2
-
-// Compare media deltas with speed-adjusted frame durations; ignore scheduling
-// jitter.
-struct avf_rate_est {
-    int64_t last_media_pts_ns;
-    int64_t last_frame_duration_ns;
-    bool last_sample_valid;
-    // Steady-state drift window.
-    int64_t media_span_ns;
-    int64_t real_span_ns;
-    // Large-change confirmation window.
-    int64_t fast_media_span_ns;
-    int64_t fast_real_span_ns;
-    int fast_sample_count;
-};
 
 @class QuasarSubtitleLayer;
 
@@ -255,7 +235,6 @@ struct priv {
     // PI state; zero on hard anchor.
     double servo_integral;
     int64_t last_servo_eval_ns;
-    struct avf_rate_est rate_est;
 
     // Pacing diagnostics, ~5s intervals.
     int64_t diag_window_start_ns;
