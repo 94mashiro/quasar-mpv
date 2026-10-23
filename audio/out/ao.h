@@ -36,6 +36,10 @@ enum aocontrol {
     AOCONTROL_UPDATE_STREAM_TITLE,
     // struct mpv_node*: native renderer eligibility and route observations.
     AOCONTROL_GET_SPATIAL_STATUS,
+    // double*: playback speed, set to the speed actually applied. CONTROL_OK
+    // only if the device applies it to everything queued, including audio
+    // already written.
+    AOCONTROL_SET_SPEED,
 };
 
 // If set, then the queued audio data is the last. Note that after a while, new
@@ -100,6 +104,7 @@ bool ao_needs_drain_before_gapless(struct ao *ao);
 int ao_control(struct ao *ao, enum aocontrol cmd, void *arg);
 void ao_set_gain(struct ao *ao, float gain);
 double ao_get_delay(struct ao *ao);
+bool ao_set_native_speed(struct ao *ao, double speed);
 void ao_reset(struct ao *ao);
 void ao_start(struct ao *ao);
 void ao_set_paused(struct ao *ao, bool paused, bool eof);

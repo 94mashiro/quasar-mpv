@@ -48,16 +48,26 @@ enum {
 
 static void ao_process(struct mp_filter *f);
 
-static bool native_compressed_needs_pcm(struct MPContext *mpctx)
+// Compressed audio decoded by Apple: mpv cannot filter it, Apple applies
+// volume and speed.
+static bool native_compressed(struct MPContext *mpctx)
 {
-    struct MPOpts *opts = mpctx->opts;
     if (!mpctx->ao || strcmp(ao_get_name(mpctx->ao), "avfoundation") != 0)
         return false;
     int rate, format;
     struct mp_chmap channels;
     ao_get_format(mpctx->ao, &rate, &format, &channels);
-    return af_fmt_is_spdif(format) &&
-        (opts->playback_speed != 1 || opts->playback_pitch != 1 ||
+    return af_fmt_is_spdif(format);
+}
+
+// Speed stays native: switching to PCM on a speed change dropped Atmos and
+// left playback decoding in mpv after returning to 1x.
+static bool native_compressed_needs_pcm(struct MPContext *mpctx)
+{
+    struct MPOpts *opts = mpctx->opts;
+    return native_compressed(mpctx) &&
+        ((opts->playback_speed != 1 && !opts->pitch_correction) ||
+         opts->playback_pitch != 1 ||
          (opts->af_settings && opts->af_settings[0].name) ||
          opts->softvol_volume > 100 || audio_get_gain(mpctx) > 1);
 }
@@ -70,6 +80,18 @@ static void update_speed_filters(struct MPContext *mpctx)
 
     if (native_compressed_needs_pcm(mpctx)) {
         ao_request_pcm_fallback(mpctx->ao);
+        return;
+    }
+
+    // Whether the AO applies the speed is known only once it exists. Before
+    // that, a speed on the chain would make it drop compressed audio.
+    if (!mpctx->ao)
+        return;
+
+    ao_c->native_speed = native_compressed(mpctx) &&
+        ao_set_native_speed(mpctx->ao, mpctx->opts->playback_speed);
+    if (ao_c->native_speed) {
+        mp_output_chain_set_audio_speed(ao_c->filter, 1.0, 1.0, 1.0);
         return;
     }
 
@@ -223,8 +245,9 @@ void update_playback_speed(struct MPContext *mpctx)
     double new_speed = mpctx->opts->playback_speed * mpctx->speed_factor_a;
     struct ao_chain *ao_c = mpctx->ao_chain;
     // display-resample calls this every frame; only a real change needs a mark.
+    // Native speed stretches queued audio too, so nothing keeps the old speed.
     if (ao_c && ao_c->ao && ao_c->last_out_pts != MP_NOPTS_VALUE &&
-        fabs(new_speed - old_speed) > 1e-6)
+        fabs(new_speed - old_speed) > 1e-6 && !ao_c->native_speed)
     {
         // Queued audio keeps the speed it was stretched at. After several
         // quick changes, treat all of it as one segment at its average speed.
@@ -549,6 +572,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
 
     ao_chain_set_ao(ao_c, mpctx->ao);
 
+    update_speed_filters(mpctx);
     audio_update_volume(mpctx);
 
     // Almost nonsensical hack to deal with certain format change scenarios.
@@ -822,7 +846,9 @@ static void ao_process(struct mp_filter *f)
         }
 
         mpctx->shown_aframes += samples;
-        double real_samplerate = mp_aframe_get_rate(af) / mpctx->audio_speed;
+        // Stretched audio covers speed times its duration in source time.
+        double real_samplerate = mp_aframe_get_rate(af) /
+                                 (ao_c->native_speed ? 1.0 : mpctx->audio_speed);
         if (mpctx->video_status != STATUS_EOF)
             mpctx->delay += samples / real_samplerate;
         ao_c->last_out_pts = mp_aframe_end_pts(af);

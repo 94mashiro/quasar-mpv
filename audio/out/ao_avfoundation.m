@@ -210,7 +210,7 @@ static void start(struct ao *ao)
             if (!p->item)
                 ao_avf_avp_create_item(ao);
             else if (p->avp_rate_applied)
-                [p->player setRate:1];
+                [p->player setRate:p->avp_rate];
             avp_timer_arm(p);
             ao_avf_feed_avp(ao);
         };
@@ -275,7 +275,7 @@ static bool set_pause(struct ao *ao, bool paused)
             } else {
                 p->avp_last_progress = mp_time_ns();
                 if (p->avp_rate_applied) {
-                    [p->player setRate:1];
+                    [p->player setRate:p->avp_rate];
                     if (p->avp_start_deadline >= 0)
                         p->avp_start_deadline = mp_time_ns() + AVP_START_GRACE_NS;
                 } else {
@@ -361,6 +361,15 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
             case AOCONTROL_SET_VOLUME:
                 p->avp_volume = MPCLAMP(*(float*)arg / 100, 0, 1);
                 ao_avf_avp_apply_volume(ao);
+                break;
+            case AOCONTROL_SET_SPEED:
+                // Compressed audio cannot be stretched in mpv. AVPlayer
+                // stretches what it already buffered, so the new speed is
+                // heard at once.
+                p->avp_rate = MPCLAMP(*(double*)arg, 0.25, 4);
+                *(double*)arg = p->avp_rate;
+                if (p->avp_playing && p->avp_rate_applied && !p->spdif_reload_requested)
+                    [p->player setRate:p->avp_rate];
                 break;
             default:
                 result = CONTROL_UNKNOWN;
@@ -509,6 +518,7 @@ static int init(struct ao *ao)
             goto error;
         }
         p->avp_volume = 1;
+        p->avp_rate = 1;
         ao_avf_avp_apply_volume(ao);
         // Own priming/start recovery here; disable player guesses against
         // synthetic endless resource.

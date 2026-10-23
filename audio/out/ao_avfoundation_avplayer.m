@@ -319,7 +319,7 @@ static void avp_update_transport(struct ao *ao)
         }
         // Do not await item readiness: preroll may need more reads after
         // rejected probes. Seek-to-start breaks remaining park.
-        [p->player setRate:1];
+        [p->player setRate:p->avp_rate];
         p->avp_rate_applied = true;
         p->avp_start_deadline = now + AVP_START_GRACE_NS;
         return;
@@ -361,7 +361,7 @@ static void avp_update_transport(struct ao *ao)
         p->avp_start_seeked = true;
         p->avp_start_deadline = now + AVP_START_GRACE_NS;
         [p->item seekToTime:kCMTimeZero completionHandler:nil];
-        [p->player setRate:1];
+        [p->player setRate:p->avp_rate];
         return;
     }
     MP_ERR(ao, "native compressed playback did not start; falling back to PCM\n");
@@ -516,6 +516,7 @@ void ao_avf_avp_create_item(struct ao *ao)
     if (@available(tvOS 15.0, iOS 15.0, macOS 12.0, *))
         p->item.allowedAudioSpatializationFormats = spatial_formats(p);
     p->item.canUseNetworkResourcesForLiveStreamingWhilePaused = YES;
+    p->item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmSpectral;
     [p->player replaceCurrentItemWithPlayerItem:p->item];
 
     p->stash_len = 0;

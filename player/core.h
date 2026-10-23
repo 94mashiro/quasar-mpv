@@ -197,6 +197,8 @@ struct ao_chain {
     // may still be queued in the AO (see audio_queue_split()).
     double speed_mark_pts;
     double speed_before;
+    // The AO applies the speed: written audio stays in source time.
+    bool native_speed;
 
     double start_pts;
     bool start_pts_known;

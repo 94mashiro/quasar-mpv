@@ -108,6 +108,7 @@ struct priv {
     int64_t pulled_samples;      // IEC samples handed over by ao_read_data
     int64_t es_dropped_ns;       // AU periods pulled but never appended
     bool avp_playing;            // desired transport state
+    double avp_rate;             // playback speed; Apple stretches queued audio
     bool avp_rate_applied;       // AVPlayer received rate 1
     bool avp_start_seeked;       // seek-to-start retry used
     bool avp_eof;

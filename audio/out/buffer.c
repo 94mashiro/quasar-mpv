@@ -55,6 +55,7 @@ struct buffer_state {
     struct mp_filter *filter_root;
     struct mp_filter *input;    // connected to queue
     struct mp_aframe *pending;  // last, not fully consumed output
+    double native_speed;        // speed the device applies; 0 = none
 
     bool streaming;             // AO streaming active
     bool playing;               // logically playing audio from buffer
@@ -382,8 +383,23 @@ double ao_get_delay(struct ao *ao)
     if (p->pending)
         pending += mp_aframe_get_size(p->pending);
 
+    double speed = p->native_speed > 0 ? p->native_speed : 1;
     mp_mutex_unlock(&p->lock);
-    return driver_delay + pending / (double)ao->samplerate;
+    // Queued audio is in source time; the device plays it at native speed.
+    return (driver_delay + pending / (double)ao->samplerate) / speed;
+}
+
+// Let the device apply the playback speed to all queued audio. Returns false
+// if it cannot; the caller then stretches the audio itself.
+bool ao_set_native_speed(struct ao *ao, double speed)
+{
+    struct buffer_state *p = ao->buffer_state;
+    if (ao_control(ao, AOCONTROL_SET_SPEED, &speed) != CONTROL_OK)
+        return false;
+    mp_mutex_lock(&p->lock);
+    p->native_speed = speed;
+    mp_mutex_unlock(&p->lock);
+    return true;
 }
 
 // Fully stop playback; clear buffers, including queue.
