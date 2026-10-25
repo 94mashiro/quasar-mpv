@@ -466,6 +466,8 @@ void avf_render_osd(struct vo *vo, double pts);
 
 void avf_release_ci_compositor(struct priv *p);
 
+// Pool copy of a decoded frame with its metadata, ready to draw on.
+CVPixelBufferRef avf_copy_frame_to_pool(struct vo *vo, CVPixelBufferRef videoBuffer);
 CVPixelBufferRef avf_composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
                                            OSType sourceFormat, bool in_place);
 

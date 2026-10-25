@@ -827,6 +827,16 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
                 CVPixelBufferRelease(composited);
                 composited = NULL;
             }
+            // Picture in picture composites subtitles, so cue frames come from
+            // the output pool and the others straight from the decoder. Send
+            // every frame through the pool there, so the system sees one kind
+            // of frame whether or not a cue is on screen.
+            if (!composited && !pixbufNeedsRelease && !p->frame_dovi && !should_use_inline_osd_layer(p) &&
+                is_biplanar_yuv_format(CVPixelBufferGetPixelFormatType(pixbuf))) {
+                composited = avf_copy_frame_to_pool(vo, pixbuf);
+                if (composited)
+                    p->video_statistics.pixel_buffer_copies++;
+            }
             if (composited) {
                 finalBuffer = composited;
                 needsRelease = true;

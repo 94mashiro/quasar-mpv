@@ -1234,6 +1234,29 @@ static void avf_copy_iosurface_values(struct vo *vo, CVPixelBufferRef src, CVPix
     CFRelease(values);
 }
 
+CVPixelBufferRef avf_copy_frame_to_pool(struct vo *vo, CVPixelBufferRef videoBuffer)
+{
+    struct priv *p = vo->priv;
+    OSType format = CVPixelBufferGetPixelFormatType(videoBuffer);
+    if (!avf_create_output_pool(vo, (int)CVPixelBufferGetWidth(videoBuffer),
+                                (int)CVPixelBufferGetHeight(videoBuffer), format))
+        return NULL;
+    CVPixelBufferRef outputBuffer = NULL;
+    CVReturn status = avf_pool_get_buffer_for_frame(vo, p->outputPool,
+                                                  &p->outputReservePool, &outputBuffer);
+    if (status != kCVReturnSuccess || !outputBuffer) {
+        MP_ERR(vo, "Failed to get YUV composite buffer: %d\n", status);
+        return NULL;
+    }
+    copy_pixel_buffer_metadata(videoBuffer, outputBuffer, format);
+    avf_copy_iosurface_values(vo, videoBuffer, outputBuffer);
+    if (!copy_pixel_buffer_planes(videoBuffer, outputBuffer)) {
+        CVPixelBufferRelease(outputBuffer);
+        return NULL;
+    }
+    return outputBuffer;
+}
+
 CVPixelBufferRef avf_composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
                                            OSType sourceFormat, bool in_place)
 {
@@ -1276,22 +1299,9 @@ CVPixelBufferRef avf_composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBu
     if (in_place) {
         outputBuffer = CVPixelBufferRetain(videoBuffer);
     } else {
-        if (!avf_create_output_pool(vo, videoW, videoH, sourceFormat))
+        outputBuffer = avf_copy_frame_to_pool(vo, videoBuffer);
+        if (!outputBuffer)
             return NULL;
-
-        CVReturn status = avf_pool_get_buffer_for_frame(vo, p->outputPool,
-                                                      &p->outputReservePool, &outputBuffer);
-        if (status != kCVReturnSuccess || !outputBuffer) {
-            MP_ERR(vo, "Failed to get YUV composite buffer: %d\n", status);
-            return NULL;
-        }
-
-        copy_pixel_buffer_metadata(videoBuffer, outputBuffer, sourceFormat);
-        avf_copy_iosurface_values(vo, videoBuffer, outputBuffer);
-        if (!copy_pixel_buffer_planes(videoBuffer, outputBuffer)) {
-            CVPixelBufferRelease(outputBuffer);
-            return NULL;
-        }
     }
 
     if (CVPixelBufferLockBaseAddress(outputBuffer, 0) != kCVReturnSuccess) {
