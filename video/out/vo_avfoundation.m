@@ -728,8 +728,6 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
             if (overlay) {
                 if (overlay != pixbuf)
                     p->video_statistics.pixel_buffer_copies++;
-                else
-                    pixels_transformed = true;
                 CVPixelBufferRelease(overlay);
             }
             if (rendered) {
@@ -792,7 +790,6 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
             if (composited) {
                 finalBuffer = composited;
                 needsRelease = true;
-                pixels_transformed = true;
             }
         }
 
@@ -860,8 +857,11 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
                 break;
             }
         }
-        // Static source mastering metadata remains meaningful after an overlay,
-        // but dynamic scene mapping describes the untouched original pixels.
+        // A subtitle overlay keeps the frame's HDR10+ scene mapping: cues sit
+        // near SDR white, and dropping it only on frames that carry a cue makes
+        // the system switch tone mapping, so brightness jumps with every cue.
+        // Vivid mapping and geometry rendering change the pixels for the whole
+        // stream and still drop it.
         int hdr_state = avf_attach_hdr10plus(buf, hdr10plus, hdr10plus_size,
                                            pixels_transformed);
         if (hdr_state != p->hdr10plus_state) {
