@@ -656,6 +656,46 @@ static int preinit(struct vo *vo)
     return 0;
 }
 
+struct avf_attachment_diff {
+    struct vo *vo;
+    CFDictionaryRef other;
+    const char *label;
+};
+
+static void avf_describe(CFTypeRef value, char *out, size_t size)
+{
+    out[0] = 0;
+    CFStringRef d = value ? CFCopyDescription(value) : NULL;
+    if (!d) return;
+    CFStringGetCString(d, out, size, kCFStringEncodingUTF8);
+    CFRelease(d);
+    for (char *c = out; *c; c++) if (*c == '\n') *c = ' ';
+}
+
+static void avf_log_attachment_entry(const void *key, const void *value, void *ctx)
+{
+    struct avf_attachment_diff *d = ctx;
+    const void *other = d->other ? CFDictionaryGetValue(d->other, key) : NULL;
+    bool removed = d->label[0] == 'r';
+    // The first pass already reported keys present in both frames.
+    if (removed ? other != NULL : other && CFEqual(other, value)) return;
+    char k[96], now[200], before[200];
+    avf_describe(key, k, sizeof(k));
+    avf_describe(removed ? NULL : value, now, sizeof(now));
+    avf_describe(removed ? value : other, before, sizeof(before));
+    MP_INFO(d->vo, "MPVUI_NATIVE_ATTACHMENTS: %s %s now=%s before=%s\n", d->label, k, now, before);
+}
+
+// Which color attachment changed between consecutive enqueued frames: the
+// system tone-maps from these, so a key that flips per frame shows on screen.
+static void avf_log_attachment_diff(struct vo *vo, CFDictionaryRef now, CFDictionaryRef before)
+{
+    struct avf_attachment_diff changed = {vo, before, "changed"};
+    if (now) CFDictionaryApplyFunction(now, avf_log_attachment_entry, &changed);
+    struct avf_attachment_diff removed = {vo, now, "removed"};
+    if (before) CFDictionaryApplyFunction(before, avf_log_attachment_entry, &removed);
+}
+
 static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *mpi)
 {
     @autoreleasepool {
@@ -816,6 +856,10 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
         CFDictionaryRef attachments = CVBufferGetAttachments(finalBuffer, kCVAttachmentMode_ShouldPropagate);
         bool metadata_equal = attachments == p->video_format_attachments ||
             (attachments && p->video_format_attachments && CFEqual(attachments, p->video_format_attachments));
+        if (!metadata_equal && p->attachment_diff_logs < 40) {
+            p->attachment_diff_logs++;
+            avf_log_attachment_diff(vo, attachments, p->video_format_attachments);
+        }
         if (!format || !metadata_equal || !CMVideoFormatDescriptionMatchesImageBuffer(format, finalBuffer)) {
             CMVideoFormatDescriptionRef new_format = NULL;
             OSStatus desc_err = CMVideoFormatDescriptionCreateForImageBuffer(
@@ -1139,6 +1183,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     MP_VERBOSE(vo, "reconfig: %dx%d\n", params->w, params->h);
     struct priv *p = vo->priv;
     p->dovi_validated_state = p->hdr10plus_state = p->vivid_state = p->fel_state = 0;
+    p->attachment_diff_logs = 0;
     p->video_statistics = (struct voctrl_native_video_statistics){0};
     p->dovi_unsupported_logged = false;
     avf_clear_sw_upload_metadata(p);
