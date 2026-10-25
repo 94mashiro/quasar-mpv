@@ -1371,9 +1371,10 @@ CVPixelBufferRef avf_composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBu
             }
         }
     }
-    // Per-frame content statistics no longer describe pixels after overlays.
-    CVBufferRemoveAttachment(outputBuffer, kCVImageBufferContentLightLevelInfoKey);
-    CVBufferRemoveAttachment(outputBuffer, CFSTR("HDR10PlusPerFrameData"));
+    // Keep the source's content light level and HDR10+ metadata. Subtitles sit
+    // near SDR white, below the content's peak; dropping the keys changes the
+    // system's tone mapping only on frames that carry a cue, so the picture
+    // brightness jumps whenever a subtitle appears or disappears.
 
     CVPixelBufferUnlockBaseAddress(p->cachedSubtitleBuffer, kCVPixelBufferLock_ReadOnly);
     CVPixelBufferUnlockBaseAddress(outputBuffer, 0);
@@ -1490,10 +1491,6 @@ CVPixelBufferRef avf_render_video_geometry_frame(struct vo *vo,
         }
     }
 
-    if (include_subtitle) {
-        CVBufferRemoveAttachment(outputBuffer, kCVImageBufferContentLightLevelInfoKey);
-        CVBufferRemoveAttachment(outputBuffer, CFSTR("HDR10PlusPerFrameData"));
-    }
     return outputBuffer;
 }
 
@@ -1635,8 +1632,6 @@ CVPixelBufferRef avf_composite_frame(struct vo *vo, CVPixelBufferRef videoBuffer
         }
     }
 
-    CVBufferRemoveAttachment(outputBuffer, kCVImageBufferContentLightLevelInfoKey);
-    CVBufferRemoveAttachment(outputBuffer, CFSTR("HDR10PlusPerFrameData"));
     return outputBuffer;
 }
 
