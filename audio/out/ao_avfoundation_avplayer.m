@@ -516,7 +516,10 @@ void ao_avf_avp_create_item(struct ao *ao)
     if (@available(tvOS 15.0, iOS 15.0, macOS 12.0, *))
         p->item.allowedAudioSpatializationFormats = spatial_formats(p);
     p->item.canUseNetworkResourcesForLiveStreamingWhilePaused = YES;
-    p->item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmSpectral;
+    // Spectral renders faster than the item timebase reports at non-1 rates
+    // (1.75x: 1.760x rendered vs 1.750x reported), so audio drifted ahead of
+    // video by seconds. TimeDomain, the system default, keeps them equal.
+    p->item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmTimeDomain;
     [p->player replaceCurrentItemWithPlayerItem:p->item];
 
     p->stash_len = 0;
