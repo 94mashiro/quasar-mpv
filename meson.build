@@ -824,7 +824,8 @@ if features['avfoundation']
 endif
 
 vo_avfoundation_frameworks = ['AVFoundation', 'CoreMedia', 'CoreVideo',
-                             'CoreImage', 'QuartzCore', 'Metal', 'IOSurface']
+                             'CoreImage', 'QuartzCore', 'Metal', 'IOSurface',
+                             'VideoToolbox']
 if cc.has_header('UIKit/UIKit.h')
     vo_avfoundation_frameworks += ['UIKit']
 elif cc.has_header('AppKit/AppKit.h')

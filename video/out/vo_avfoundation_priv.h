@@ -57,6 +57,7 @@
 #import <CoreImage/CoreImage.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
+#import <VideoToolbox/VideoToolbox.h>
 #import <TargetConditionals.h>
 #include <pthread.h>
 
@@ -189,6 +190,7 @@ struct priv {
     // Compositing mode.
     __strong id<MTLDevice> mtlDevice;
     __strong CIContext *ciContext;
+    VTPixelTransferSessionRef transferSession;
     CVPixelBufferPoolRef outputPool;
     CVPixelBufferPoolRef outputReservePool;
     int output_pool_w, output_pool_h;

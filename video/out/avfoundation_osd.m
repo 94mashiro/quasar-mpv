@@ -1146,6 +1146,11 @@ void avf_release_ci_compositor(struct priv *p)
     avf_subtitle_image_cache_clear(&p->subtitleImageCache);
     [p->ciContext release];
     p->ciContext = nil;
+    if (p->transferSession) {
+        VTPixelTransferSessionInvalidate(p->transferSession);
+        CFRelease(p->transferSession);
+        p->transferSession = NULL;
+    }
     [p->mtlDevice release];
     p->mtlDevice = nil;
 }
@@ -1250,6 +1255,15 @@ CVPixelBufferRef avf_copy_frame_to_pool(struct vo *vo, CVPixelBufferRef videoBuf
     }
     copy_pixel_buffer_metadata(videoBuffer, outputBuffer, format);
     avf_copy_iosurface_values(vo, videoBuffer, outputBuffer);
+    // Picture in picture copies every frame; a CPU memcpy of a 4K P010 frame
+    // costs the vo thread 6-16 ms. The transfer session copies on the GPU.
+    // Both buffers carry the same color attachments, so it converts nothing.
+    if (!p->transferSession &&
+        VTPixelTransferSessionCreate(kCFAllocatorDefault, &p->transferSession) != noErr)
+        p->transferSession = NULL;
+    if (p->transferSession &&
+        VTPixelTransferSessionTransferImage(p->transferSession, videoBuffer, outputBuffer) == noErr)
+        return outputBuffer;
     if (!copy_pixel_buffer_planes(videoBuffer, outputBuffer)) {
         CVPixelBufferRelease(outputBuffer);
         return NULL;
