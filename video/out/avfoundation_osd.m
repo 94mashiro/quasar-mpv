@@ -20,6 +20,8 @@
  * quasar/AVFOUNDATION_CREDITS.md.
  */
 
+#include <IOSurface/IOSurfaceRef.h>
+
 #include "vo_avfoundation_priv.h"
 
 void avf_update_avfoundation_geometry(struct vo *vo)
@@ -1203,6 +1205,35 @@ static CIImage *subtitle_ci_image(struct vo *vo, CVPixelBufferRef videoBuffer)
     return avf_cached_subtitle_image(&p->subtitleImageCache, sub, cs, &color);
 }
 
+// VideoToolbox also tags the decoded surface itself (for example
+// SidebandVideoPropertiesLookupID); attachments alone do not carry those
+// values. Copy them so a composited frame is presented like the decoded one.
+static void avf_copy_iosurface_values(struct vo *vo, CVPixelBufferRef src, CVPixelBufferRef dst)
+{
+    struct priv *p = vo->priv;
+    IOSurfaceRef from = CVPixelBufferGetIOSurface(src), to = CVPixelBufferGetIOSurface(dst);
+    if (!from || !to)
+        return;
+    IOSurfaceRemoveAllValues(to);
+    CFDictionaryRef values = IOSurfaceCopyAllValues(from);
+    if (!values)
+        return;
+    IOSurfaceSetValues(to, values);
+    if (!p->iosurface_values_logged) {
+        p->iosurface_values_logged = true;
+        CFStringRef d = CFCopyDescription(values);
+        char text[600] = "";
+        if (d) {
+            CFStringGetCString(d, text, sizeof(text), kCFStringEncodingUTF8);
+            CFRelease(d);
+        }
+        for (char *c = text; *c; c++) if (*c == '\n') *c = ' ';
+        MP_INFO(vo, "MPVUI_NATIVE_IOSURFACE: copied %ld values %s\n",
+                (long)CFDictionaryGetCount(values), text);
+    }
+    CFRelease(values);
+}
+
 CVPixelBufferRef avf_composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
                                            OSType sourceFormat, bool in_place)
 {
@@ -1256,6 +1287,7 @@ CVPixelBufferRef avf_composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBu
         }
 
         copy_pixel_buffer_metadata(videoBuffer, outputBuffer, sourceFormat);
+        avf_copy_iosurface_values(vo, videoBuffer, outputBuffer);
         if (!copy_pixel_buffer_planes(videoBuffer, outputBuffer)) {
             CVPixelBufferRelease(outputBuffer);
             return NULL;

@@ -303,6 +303,7 @@ struct priv {
     bool composite_size_mismatch_logged;
     // Frame-to-frame color attachment changes logged since the last reconfig.
     int attachment_diff_logs;
+    bool iosurface_values_logged;
 
 };
 

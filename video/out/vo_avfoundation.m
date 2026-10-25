@@ -1184,6 +1184,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     struct priv *p = vo->priv;
     p->dovi_validated_state = p->hdr10plus_state = p->vivid_state = p->fel_state = 0;
     p->attachment_diff_logs = 0;
+    p->iosurface_values_logged = false;
     p->video_statistics = (struct voctrl_native_video_statistics){0};
     p->dovi_unsupported_logged = false;
     avf_clear_sw_upload_metadata(p);
