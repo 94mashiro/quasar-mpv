@@ -809,9 +809,14 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
             CVPixelBufferRef composited = avf_composite_frame(vo, pixbuf, pixbufNeedsRelease);
             if (composited && composited != pixbuf)
                 p->video_statistics.pixel_buffer_copies++;
+            int pool_w, pool_h;
+            avf_pool_frame_size((int)CVPixelBufferGetWidth(pixbuf), (int)CVPixelBufferGetHeight(pixbuf),
+                                &pool_w, &pool_h);
             if (composited && should_use_frame_space_osd(p) &&
                 (CVPixelBufferGetWidth(composited) != CVPixelBufferGetWidth(pixbuf) ||
-                 CVPixelBufferGetHeight(composited) != CVPixelBufferGetHeight(pixbuf))) {
+                 CVPixelBufferGetHeight(composited) != CVPixelBufferGetHeight(pixbuf)) &&
+                (CVPixelBufferGetWidth(composited) != (size_t)pool_w ||
+                 CVPixelBufferGetHeight(composited) != (size_t)pool_h)) {
                 // PiP window follows sample dimensions. Reject resized
                 // composite and present bare frame to avoid per-cue resizing.
                 if (!p->composite_size_mismatch_logged) {

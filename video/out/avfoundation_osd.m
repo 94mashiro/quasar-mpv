@@ -1243,8 +1243,10 @@ static CVPixelBufferRef copy_frame_to_pool(struct vo *vo, CVPixelBufferRef video
 {
     struct priv *p = vo->priv;
     OSType format = CVPixelBufferGetPixelFormatType(videoBuffer);
-    if (!avf_create_output_pool(vo, (int)CVPixelBufferGetWidth(videoBuffer),
-                                (int)CVPixelBufferGetHeight(videoBuffer), format))
+    int w = (int)CVPixelBufferGetWidth(videoBuffer), h = (int)CVPixelBufferGetHeight(videoBuffer);
+    int out_w, out_h;
+    avf_pool_frame_size(w, h, &out_w, &out_h);
+    if (!avf_create_output_pool(vo, out_w, out_h, format))
         return NULL;
     CVPixelBufferRef outputBuffer = NULL;
     CVReturn status = avf_pool_get_buffer_for_frame(vo, p->outputPool,
@@ -1258,6 +1260,8 @@ static CVPixelBufferRef copy_frame_to_pool(struct vo *vo, CVPixelBufferRef video
     // Picture in picture copies every frame; a CPU memcpy of a 4K P010 frame
     // costs the vo thread 6-16 ms. The transfer session copies on the GPU.
     // Both buffers carry the same color attachments, so it converts nothing.
+    // Scaling stretches the source's clean aperture and pixel aspect onto the
+    // destination (kVTScalingMode_Normal).
     if (!p->transferSession &&
         VTPixelTransferSessionCreate(kCFAllocatorDefault, &p->transferSession) != noErr)
         p->transferSession = NULL;
@@ -1265,7 +1269,7 @@ static CVPixelBufferRef copy_frame_to_pool(struct vo *vo, CVPixelBufferRef video
         VTPixelTransferSessionTransferImage(p->transferSession, videoBuffer, outputBuffer) == noErr)
         return outputBuffer;
     p->pool_stats.memcpy++;
-    if (!copy_pixel_buffer_planes(videoBuffer, outputBuffer)) {
+    if (out_w != w || out_h != h || !copy_pixel_buffer_planes(videoBuffer, outputBuffer)) {
         CVPixelBufferRelease(outputBuffer);
         return NULL;
     }
@@ -1281,9 +1285,10 @@ CVPixelBufferRef avf_copy_frame_to_pool(struct vo *vo, CVPixelBufferRef videoBuf
     p->pool_stats.copy_ns += mp_time_ns() - t;
     if (++p->pool_stats.frames % 120 == 0) {
         int64_t n = p->pool_stats.frames, s = p->pool_stats.subtitled;
-        MP_INFO(vo, "MPVUI_NATIVE_POOL: %dx%d frames=%" PRId64 " memcpy=%" PRId64 " subtitled=%" PRId64
+        MP_INFO(vo, "MPVUI_NATIVE_POOL: %dx%d->%dx%d frames=%" PRId64 " memcpy=%" PRId64 " subtitled=%" PRId64
                 " copy=%" PRId64 "us blend=%" PRId64 "us\n",
                 (int)CVPixelBufferGetWidth(videoBuffer), (int)CVPixelBufferGetHeight(videoBuffer),
+                out ? (int)CVPixelBufferGetWidth(out) : 0, out ? (int)CVPixelBufferGetHeight(out) : 0,
                 n, p->pool_stats.memcpy, s,
                 p->pool_stats.copy_ns / n / 1000, s ? p->pool_stats.blend_ns / s / 1000 : 0);
         memset(&p->pool_stats, 0, sizeof(p->pool_stats));
@@ -1329,6 +1334,19 @@ static CVPixelBufferRef composite_yuv_frame(struct vo *vo, CVPixelBufferRef vide
         return NULL;
 
     struct avf_render_geometry geometry = get_render_geometry(vo, videoW, videoH);
+    if (!in_place) {
+        // The pool copy may be smaller; subtitles stay on the frame's grid
+        // and are sampled down onto it.
+        int poolW, poolH;
+        avf_pool_frame_size(videoW, videoH, &poolW, &poolH);
+        if (poolW != videoW || poolH != videoH) {
+            struct mp_rect *r = &geometry.src;
+            *r = (struct mp_rect){r->x0 * poolW / videoW, r->y0 * poolH / videoH,
+                                  r->x1 * poolW / videoW, r->y1 * poolH / videoH};
+            videoW = poolW;
+            videoH = poolH;
+        }
+    }
     struct mp_rect src = geometry.src;
     struct mp_rect dst = geometry.dst;
     int srcW = src.x1 - src.x0;

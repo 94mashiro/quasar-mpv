@@ -315,6 +315,17 @@ static inline bool should_composite_into_video(struct priv *p)
     return true;
 }
 
+// Size of a frame copied into the output pool. Only picture in picture copies
+// every frame, and its window stays near 1000 px wide: past 1920x1080 (long x
+// short edge) the extra pixels only cost the copy and the subtitle blend.
+// Never enlarges; keeps the aspect and 4:2:0's even sizes.
+static inline void avf_pool_frame_size(int w, int h, int *out_w, int *out_h)
+{
+    double s = MPMIN(1.0, MPMIN(1920.0 / MPMAX(w, h), 1080.0 / MPMIN(w, h)));
+    *out_w = s < 1.0 ? MPMAX(2, (int)(w * s) & ~1) : w;
+    *out_h = s < 1.0 ? MPMAX(2, (int)(h * s) & ~1) : h;
+}
+
 static inline bool should_use_inline_osd_layer(struct priv *p)
 {
     return p->frame_dovi || p->opts->osd_layer == 1;
