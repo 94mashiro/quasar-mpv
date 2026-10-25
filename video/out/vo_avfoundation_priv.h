@@ -191,6 +191,7 @@ struct priv {
     __strong id<MTLDevice> mtlDevice;
     __strong CIContext *ciContext;
     VTPixelTransferSessionRef transferSession;
+    struct { int64_t frames, subtitled, memcpy, copy_ns, blend_ns; } pool_stats;
     CVPixelBufferPoolRef outputPool;
     CVPixelBufferPoolRef outputReservePool;
     int output_pool_w, output_pool_h;

@@ -1239,7 +1239,7 @@ static void avf_copy_iosurface_values(struct vo *vo, CVPixelBufferRef src, CVPix
     CFRelease(values);
 }
 
-CVPixelBufferRef avf_copy_frame_to_pool(struct vo *vo, CVPixelBufferRef videoBuffer)
+static CVPixelBufferRef copy_frame_to_pool(struct vo *vo, CVPixelBufferRef videoBuffer)
 {
     struct priv *p = vo->priv;
     OSType format = CVPixelBufferGetPixelFormatType(videoBuffer);
@@ -1264,6 +1264,7 @@ CVPixelBufferRef avf_copy_frame_to_pool(struct vo *vo, CVPixelBufferRef videoBuf
     if (p->transferSession &&
         VTPixelTransferSessionTransferImage(p->transferSession, videoBuffer, outputBuffer) == noErr)
         return outputBuffer;
+    p->pool_stats.memcpy++;
     if (!copy_pixel_buffer_planes(videoBuffer, outputBuffer)) {
         CVPixelBufferRelease(outputBuffer);
         return NULL;
@@ -1271,8 +1272,45 @@ CVPixelBufferRef avf_copy_frame_to_pool(struct vo *vo, CVPixelBufferRef videoBuf
     return outputBuffer;
 }
 
+// Diagnostics: where picture in picture spends the vo thread, every 120 frames.
+CVPixelBufferRef avf_copy_frame_to_pool(struct vo *vo, CVPixelBufferRef videoBuffer)
+{
+    struct priv *p = vo->priv;
+    int64_t t = mp_time_ns();
+    CVPixelBufferRef out = copy_frame_to_pool(vo, videoBuffer);
+    p->pool_stats.copy_ns += mp_time_ns() - t;
+    if (++p->pool_stats.frames % 120 == 0) {
+        int64_t n = p->pool_stats.frames, s = p->pool_stats.subtitled;
+        MP_INFO(vo, "MPVUI_NATIVE_POOL: %dx%d frames=%" PRId64 " memcpy=%" PRId64 " subtitled=%" PRId64
+                " copy=%" PRId64 "us blend=%" PRId64 "us\n",
+                (int)CVPixelBufferGetWidth(videoBuffer), (int)CVPixelBufferGetHeight(videoBuffer),
+                n, p->pool_stats.memcpy, s,
+                p->pool_stats.copy_ns / n / 1000, s ? p->pool_stats.blend_ns / s / 1000 : 0);
+        memset(&p->pool_stats, 0, sizeof(p->pool_stats));
+    }
+    return out;
+}
+
+static CVPixelBufferRef composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
+                                            OSType sourceFormat, bool in_place);
+
 CVPixelBufferRef avf_composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
                                            OSType sourceFormat, bool in_place)
+{
+    struct priv *p = vo->priv;
+    int64_t copy = p->pool_stats.copy_ns, t = mp_time_ns();
+    CVPixelBufferRef out = composite_yuv_frame(vo, videoBuffer, sourceFormat, in_place);
+    if (out) {
+        p->pool_stats.subtitled++;
+        // copy_ns may have been reset by the report inside; then count it all as blend
+        int64_t copied = p->pool_stats.copy_ns >= copy ? p->pool_stats.copy_ns - copy : 0;
+        p->pool_stats.blend_ns += mp_time_ns() - t - copied;
+    }
+    return out;
+}
+
+static CVPixelBufferRef composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
+                                            OSType sourceFormat, bool in_place)
 {
     struct priv *p = vo->priv;
 
