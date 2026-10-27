@@ -411,6 +411,14 @@ static NSString *const qsub_shader_source =
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
         CFRelease(texRef);
         CVPixelBufferRelease(buf);
+        // Refused in the background (picture in picture closed from the home
+        // screen): hide the stale drawable and redraw on the next wake.
+        if (b.status == MTLCommandBufferStatusError) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_layer.hidden = YES;
+                self->_forceDraw = true;
+            });
+        }
     }];
     [cmd presentDrawable:drawable];
     [cmd commit];
