@@ -329,9 +329,14 @@ static NSString *const qsub_shader_source =
         CAMetalLayer *layer = [self layer];
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
-        if (layer.superlayer != displayLayer)
+        // The host app may move the layer into the picture-in-picture window
+        // (the system shows only the display layer's samples there, and
+        // Dolby Vision frames cannot take composited subtitles). While it is
+        // marked hosted, the host owns its superlayer and frame.
+        bool hosted = [[layer valueForKey:@"quasarSubtitleHosted"] boolValue];
+        if (!hosted && layer.superlayer != displayLayer)
             [displayLayer addSublayer:layer];
-        if (!CGRectEqualToRect(layer.frame, displayLayer.bounds))
+        if (!hosted && !CGRectEqualToRect(layer.frame, displayLayer.bounds))
             layer.frame = displayLayer.bounds;
         // The OSD buffer is frame-space (video size), so the same gravity
         // puts it on the video rect.
