@@ -437,6 +437,13 @@ static inline int64_t cm_time_to_ns(CMTime time)
     id<MTLRenderPipelineState> _pipeline;
     CVMetalTextureCacheRef _textureCache;
     CADisplayLink *_link;
+    // Picture in picture: the host marks the layer hosted (see
+    // QuasarSubtitleMetalLayer). The app may be in the background, where
+    // display links stop and Metal refuses command buffers, so cues are
+    // timed by a dispatch timer and shown as IOSurface contents of _cpuLayer.
+    dispatch_source_t _timer;
+    CALayer *_cpuLayer;
+    bool _forceDraw;
     pthread_mutex_t _lock;
     struct { int64_t pts_ns; CVPixelBufferRef buf; bool immediate; } _entries[QSUB_QUEUE_MAX];
     int _count;
@@ -454,6 +461,7 @@ static inline int64_t cm_time_to_ns(CMTime time)
 - (void)setGain:(double)gain;
 - (void)attachToDisplayLayer:(AVSampleBufferDisplayLayer *)displayLayer;
 - (void)invalidate;
+- (void)hostedDidChange;
 @end
 
 // Presentation pool capacity follows the scheduled queue, with three buffers for

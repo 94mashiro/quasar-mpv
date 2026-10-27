@@ -48,6 +48,21 @@ static NSString *const qsub_shader_source =
      "    return float4(lin * a * boost, a);\n"
      "}\n";
 
+// The host app sets quasarSubtitleHosted through KVC, on main, when it moves
+// the layer into the picture-in-picture window and back.
+@interface QuasarSubtitleMetalLayer : CAMetalLayer
+@property (nonatomic) BOOL quasarSubtitleHosted;
+@property (nonatomic, assign) QuasarSubtitleLayer *owner;
+@end
+
+@implementation QuasarSubtitleMetalLayer
+- (void)setQuasarSubtitleHosted:(BOOL)hosted
+{
+    _quasarSubtitleHosted = hosted;
+    [_owner hostedDidChange];
+}
+@end
+
 @implementation QuasarSubtitleLayer
 
 // Main-thread logging. vo->log dies with the VO right after -invalidate, and
@@ -107,7 +122,9 @@ static NSString *const qsub_shader_source =
 - (CAMetalLayer *)layer
 {
     if (!_layer) {
-        _layer = [[CAMetalLayer alloc] init];
+        QuasarSubtitleMetalLayer *ml = [[QuasarSubtitleMetalLayer alloc] init];
+        ml.owner = self;
+        _layer = ml;
         _layer.device = _device;
         _layer.pixelFormat = MTLPixelFormatRGBA16Float;
         _layer.framebufferOnly = YES;
@@ -126,6 +143,8 @@ static NSString *const qsub_shader_source =
     for (int i = 0; i < _count; i++)
         CVPixelBufferRelease(_entries[i].buf);
     CVPixelBufferRelease(_current);
+    ((QuasarSubtitleMetalLayer *)_layer).owner = nil;
+    [_cpuLayer release];
     if (_textureCache)
         CFRelease(_textureCache);
     if (_timebase)
@@ -142,15 +161,64 @@ static NSString *const qsub_shader_source =
 {
     [self retain];
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!self->_link) {
-            self->_link = [[CADisplayLink displayLinkWithTarget:self
-                                                       selector:@selector(tick:)] retain];
-            [self->_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-            [self logMain:MSGL_V format:"Subtitle layer: display link started\n"];
-        }
-        self->_link.paused = NO;
+        [self schedule];
         [self release];
     });
+}
+
+// Main thread from here on.
+- (bool)hosted
+{
+    return ((QuasarSubtitleMetalLayer *)_layer).quasarSubtitleHosted;
+}
+
+- (void)hostedDidChange
+{
+    [self logMain:MSGL_V format:"Subtitle layer: hosted=%d\n", [self hosted]];
+    _forceDraw = true;
+    [self schedule];
+}
+
+// Display link on screen; timer while hosted. The timer handler retains self
+// until -stopTimer.
+- (void)schedule
+{
+    if ([self hosted]) {
+        _link.paused = YES;
+        if (!_timer) {
+            _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                            dispatch_get_main_queue());
+            dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, NSEC_PER_SEC / 60,
+                                      NSEC_PER_SEC / 240);
+            dispatch_source_set_event_handler(_timer, ^{
+                [self tick:CACurrentMediaTime() timer:true];
+            });
+            dispatch_resume(_timer);
+        }
+        return;
+    }
+    [self stopTimer];
+    if (!_link) {
+        _link = [[CADisplayLink displayLinkWithTarget:self
+                                             selector:@selector(linkTick:)] retain];
+        [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        [self logMain:MSGL_V format:"Subtitle layer: display link started\n"];
+    }
+    _link.paused = NO;
+}
+
+- (void)stopTimer
+{
+    if (!_timer)
+        return;
+    dispatch_source_cancel(_timer);
+    dispatch_release(_timer);
+    _timer = NULL;
+}
+
+- (void)linkTick:(CADisplayLink *)link
+{
+    [self tick:link.targetTimestamp timer:false];
 }
 
 - (void)enqueueSampleBuffer:(CMSampleBufferRef)buf
@@ -217,14 +285,19 @@ static NSString *const qsub_shader_source =
     [self logMain:MSGL_V format:"Subtitle layer gain=%.2f EDR=%s\n", gain, hdr ? "on" : "off"];
 }
 
-- (void)tick:(CADisplayLink *)link
+- (void)tick:(CFTimeInterval)target timer:(bool)timer
 {
     [self layer];
+    bool hosted = [self hosted];
+    if (hosted != timer) {
+        [self schedule];
+        return;
+    }
     int64_t now = 0;
     if (_timebase) {
         double rate = CMTimebaseGetRate(_timebase);
         now = cm_time_to_ns(CMTimebaseGetTime(_timebase)) +
-            (int64_t)((link.targetTimestamp - CACurrentMediaTime()) * rate * 1e9);
+            (int64_t)((target - CACurrentMediaTime()) * rate * 1e9);
     }
 
     pthread_mutex_lock(&_lock);
@@ -246,7 +319,8 @@ static NSString *const qsub_shader_source =
     bool idle = _count == 0;
     pthread_mutex_unlock(&_lock);
 
-    bool redraw = gain != _appliedGain;
+    bool redraw = gain != _appliedGain || _forceDraw;
+    _forceDraw = false;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     [self applyGain:gain];
@@ -260,17 +334,41 @@ static NSString *const qsub_shader_source =
         redraw = true;
     }
     if (redraw || clear)
-        [self draw:gain];
+        [self draw:gain hosted:hosted];
     [CATransaction commit];
-    if (idle)
-        link.paused = YES;
+    if (idle && timer)
+        [self stopTimer];
+    else if (idle)
+        _link.paused = YES;
+}
+
+// No GPU work: the render server composites the OSD IOSurface itself. SDR
+// only; the EDR gain needs the shader.
+- (void)drawHosted:(CVPixelBufferRef)buf
+{
+    _layer.hidden = YES;
+    if (!_cpuLayer) {
+        _cpuLayer = [[CALayer alloc] init];
+        _cpuLayer.zPosition = 1;
+    }
+    if (_cpuLayer.superlayer != _layer.superlayer)
+        [_layer.superlayer addSublayer:_cpuLayer];
+    _cpuLayer.frame = _layer.frame;
+    _cpuLayer.contentsGravity = _layer.contentsGravity;
+    _cpuLayer.contents = buf ? (id)CVPixelBufferGetIOSurface(buf) : nil;
+    _cpuLayer.hidden = !buf;
 }
 
 // An empty OSD sample (cue ended) is a fully transparent buffer; hiding the
 // layer covers it and the cleared state without a GPU pass.
-- (void)draw:(float)gain
+- (void)draw:(float)gain hosted:(bool)hosted
 {
     CVPixelBufferRef buf = _current;
+    if (hosted) {
+        [self drawHosted:buf];
+        return;
+    }
+    [_cpuLayer removeFromSuperlayer];
     if (!buf) {
         _layer.hidden = YES;
         return;
@@ -333,7 +431,7 @@ static NSString *const qsub_shader_source =
         // (the system shows only the display layer's samples there, and
         // Dolby Vision frames cannot take composited subtitles). While it is
         // marked hosted, the host owns its superlayer and frame.
-        bool hosted = [[layer valueForKey:@"quasarSubtitleHosted"] boolValue];
+        bool hosted = [self hosted];
         if (!hosted && layer.superlayer != displayLayer)
             [displayLayer addSublayer:layer];
         if (!hosted && !CGRectEqualToRect(layer.frame, displayLayer.bounds))
@@ -366,8 +464,11 @@ static NSString *const qsub_shader_source =
         [self->_link invalidate];
         [self->_link release];
         self->_link = nil;
+        [self stopTimer];
+        ((QuasarSubtitleMetalLayer *)self->_layer).owner = nil;
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
+        [self->_cpuLayer removeFromSuperlayer];
         [self->_layer removeFromSuperlayer];
         [CATransaction commit];
         [self release];
