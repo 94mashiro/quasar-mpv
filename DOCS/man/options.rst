@@ -2484,7 +2484,8 @@ Subtitles
 
     There are some caveats associated with this feature. For example, bitmap
     subtitles will always be rendered in their usual position, so selecting a
-    bitmap subtitle as secondary subtitle will result in overlapping subtitles.
+    bitmap subtitle as secondary subtitle will result in overlapping subtitles,
+    unless ``--secondary-sub-stack`` moves the primary subtitle above it.
     Secondary subtitles are never shown on the terminal if video is disabled.
 
     .. note::
