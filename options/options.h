@@ -158,6 +158,7 @@ struct mp_osd_render_opts {
     int osd_glyph_limit;
     int osd_bitmap_max_size;
     int osd_shaper;
+    bool secondary_sub_stack;
 };
 
 struct mp_bluray_opts {

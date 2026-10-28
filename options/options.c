@@ -428,6 +428,7 @@ const struct m_sub_options mp_osd_render_sub_opts = {
         {"osd-glyph-limit", OPT_INT(osd_glyph_limit)},
         {"osd-bitmap-max-size", OPT_INT(osd_bitmap_max_size)},
         {"osd-shaper", OPT_CHOICE(osd_shaper, {"simple", 0}, {"complex", 1})},
+        {"secondary-sub-stack", OPT_BOOL(secondary_sub_stack)},
         {0}
     },
     .size = sizeof(OPT_BASE_STRUCT),

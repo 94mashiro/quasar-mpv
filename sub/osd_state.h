@@ -52,6 +52,9 @@ struct osd_object {
     struct mp_osd_res vo_res;
     bool vo_had_output;
 
+    // OSDTYPE_SUB：上一帧 --secondary-sub-stack 的上移量和移动的 part 数
+    int stack_dy, stack_lifted;
+
     // Internally used by osd_libass.c
     bool changed;
     struct ass_state ass;

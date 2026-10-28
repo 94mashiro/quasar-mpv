@@ -37,6 +37,7 @@
 #include "player/command.h"
 #include "osd.h"
 #include "osd_state.h"
+#include "osd_stack.h"
 #include "dec_sub.h"
 #include "img_convert.h"
 #include "draw_bmp.h"
@@ -355,6 +356,55 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
     return res;
 }
 
+// --secondary-sub-stack：主、副字幕都有位图时，把主字幕贴底的那一簇抬到副字幕上方。
+// parts 归调用方所有：sd_ass、sd_lavc 都经 sub_bitmaps_copy() 返回新分配的 parts，
+// 改 y 不会影响解码器的缓存，下一帧也不会叠加位移。位图像素不动。
+static void stack_subs(struct osd_state *osd, struct sub_bitmap_list *list)
+{
+    struct sub_bitmaps *pri = NULL, *sec = NULL;
+    for (int n = 0; n < list->num_items; n++) {
+        if (list->items[n]->render_index == OSDTYPE_SUB)
+            pri = list->items[n];
+        if (list->items[n]->render_index == OSDTYPE_SUB2)
+            sec = list->items[n];
+    }
+
+    int dy = 0, lifted = 0;
+    if (osd->opts->secondary_sub_stack && pri && sec) {
+        int num = pri->num_parts + sec->num_parts;
+        struct osd_stack_span *spans = talloc_array(NULL, struct osd_stack_span, num);
+        bool *lift = talloc_array(spans, bool, pri->num_parts);
+        for (int n = 0; n < num; n++) {
+            struct sub_bitmap *b = n < pri->num_parts ? &pri->parts[n]
+                                   : &sec->parts[n - pri->num_parts];
+            spans[n] = (struct osd_stack_span){b->y, b->y + b->dh};
+        }
+        // ponytail: 间隙取画面高 1%（约默认字号五分之一行），并簇距离取 5%（约默认字号一行）；
+        // 字号调得很大时按实际行高算才准
+        dy = osd_stack_lift(spans, pri->num_parts, spans + pri->num_parts,
+                            sec->num_parts, list->h / 100, list->h / 20, lift);
+        for (int n = 0; dy && n < pri->num_parts; n++) {
+            if (lift[n]) {
+                pri->parts[n].y -= dy;
+                lifted++;
+            }
+        }
+        talloc_free(spans);
+    }
+
+    // 位移变了而主字幕内容没变时，VO 按 change_id 缓存的旧位置要重画：
+    // 单项（gpu 的 osd.c、draw_bmp）和整表（vo_avfoundation）的 change_id 都要变
+    struct osd_object *obj = osd->objs[OSDTYPE_SUB];
+    if (dy != obj->stack_dy || lifted != obj->stack_lifted) {
+        obj->stack_dy = dy;
+        obj->stack_lifted = lifted;
+        obj->vo_change_id += 1;
+        list->change_id += 1;
+        if (pri)
+            pri->change_id = obj->vo_change_id;
+    }
+}
+
 // Render OSD to a list of bitmap and return it. The returned object is
 // refcounted. Typically you should hold it only for a short time, and then
 // release it.
@@ -379,6 +429,8 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
     if (draw_flags & OSD_DRAW_SUB_FILTER)
         draw_flags |= OSD_DRAW_SUB_ONLY;
 
+    bool subs_drawn = false;
+
     for (int n = 0; n < MAX_OSD_PARTS; n++) {
         struct osd_object *obj = osd->objs[n];
 
@@ -390,6 +442,9 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
             continue;
         if ((draw_flags & OSD_DRAW_OSD_ONLY) && obj->is_sub)
             continue;
+
+        if (obj->type == OSDTYPE_SUB)
+            subs_drawn = true;
 
         char *stat_type_render = obj->is_sub ? "sub-render" : "osd-render";
         stats_time_start(osd->stats, stat_type_render);
@@ -414,6 +469,10 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
 
         talloc_free(imgs);
     }
+
+    // 只画 OSD 的那次调用不碰叠放状态，否则和只画字幕的调用来回改 change_id
+    if (subs_drawn)
+        stack_subs(osd, list);
 
     double elapsed = MP_TIME_NS_TO_MS(mp_time_ns() - start_time);
     bool slow = elapsed > 5;

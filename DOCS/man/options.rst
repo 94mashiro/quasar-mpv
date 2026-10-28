@@ -2573,6 +2573,13 @@ Subtitles
     Factor for the secondary text subtitle font size, applied on top of
     ``--sub-scale`` (default: 1). Outline and shadow scale with it.
 
+``--secondary-sub-stack=<yes|no>``
+    When both primary and secondary subtitles are shown and overlap vertically,
+    move the bottom block of primary subtitle bitmaps up so that it sits just
+    above the secondary subtitle (default: no). Use with
+    ``--secondary-sub-pos=100`` to put the secondary subtitle at the bottom.
+    Bitmaps far from the secondary subtitle (signs, top titles) stay in place.
+
 ``--sub-speed=<0.1-10.0>``
     Multiply the subtitle event timestamps with the given value. Can be used
     to fix the playback speed for frame-based subtitle formats. Affects text
