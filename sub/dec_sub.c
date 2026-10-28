@@ -334,9 +334,10 @@ static bool update_pkt_cache(struct dec_sub *sub, double video_pts)
 // packets_read is false, the player should wait until the demuxer signals new
 // packets and retry.
 void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
-                      bool *packets_read, bool *sub_updated)
+                      bool *packets_read, bool *sub_updated, bool *cue_ready)
 {
     *packets_read = true;
+    *cue_ready = false;
     mp_mutex_lock(&sub->lock);
     video_pts = pts_to_subtitle(sub, video_pts);
     while (1) {
@@ -375,6 +376,7 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
         if (sub->recorder_sink)
             mp_recorder_feed_packet(sub->recorder_sink, pkt);
 
+        double prev_pkt_pts = sub->last_pkt_pts;
         sub->last_pkt_pts = pkt->pts;
         MP_TARRAY_APPEND(sub, sub->cached_pkts, sub->num_cached_pkts, pkt);
 
@@ -385,8 +387,19 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
             break;
         }
 
-        if (!(sub->preload_attempted && sub->sd->preload_ok))
+        if (!(sub->preload_attempted && sub->sd->preload_ok)) {
             sub->sd->driver->decode(sub->sd, pkt);
+            // The cue at video_pts is final once the first packet past it is
+            // read (PGS cues end at the next display set), or when a cue with
+            // a duration covers it. Not for every packet read further ahead.
+            if (video_pts != MP_NOPTS_VALUE) {
+                bool crossed = pkt->pts > video_pts &&
+                    (prev_pkt_pts == MP_NOPTS_VALUE || prev_pkt_pts <= video_pts);
+                bool covers = pkt->duration >= 0 && pkt->pts <= video_pts &&
+                    video_pts < pkt->pts + pkt->duration;
+                *cue_ready |= crossed || covers;
+            }
+        }
     }
     if (sub->cached_pkts && sub->num_cached_pkts) {
         bool visible = is_packet_visible(sub->cached_pkts[sub->cached_pkt_pos], video_pts);

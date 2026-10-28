@@ -126,12 +126,22 @@ static bool update_subtitle(struct MPContext *mpctx, double video_pts,
 
     bool packets_read = false;
     bool sub_updated = false;
-    sub_read_packets(dec_sub, video_pts, mpctx->paused, &packets_read, &sub_updated);
+    bool cue_ready = false;
+    sub_read_packets(dec_sub, video_pts, mpctx->paused, &packets_read, &sub_updated,
+                     &cue_ready);
 
     // Paused seeks and track switches can decode cues after PLAYBACK_RESTART.
     // There may be no subsequent video tick to notify property observers.
     if (sub_updated || track->redraw_subs)
         mp_notify_property(mpctx, "sub-text-snapshot");
+
+    // Paused video gets no new frame to show cues decoded after a track
+    // switch. Wait until the cue at video_pts is final, or the earlier cues
+    // flash by while the refresh seek catches up. During a seek the new frame
+    // brings them; redrawing the old frame would render at its stale pts.
+    if (cue_ready && mpctx->paused && mpctx->restart_complete && !still_image &&
+        mpctx->video_out)
+        vo_redraw(mpctx->video_out);
 
     double osd_pts = osd_get_force_video_pts(mpctx->osd);
 
