@@ -2570,12 +2570,15 @@ Subtitles
     to ``--sub-pos`` but for secondary subtitles.
 
 ``--secondary-sub-scale=<0-100>``
-    Factor for the secondary text subtitle font size (default: 1). Outline and
+    Factor for the secondary subtitle size (default: 1). Outline and
     shadow scale with it. It multiplies ``--sub-scale`` only where
     ``--sub-scale`` applies, that is with ``--secondary-sub-ass-override``
     set to ``scale``, ``force`` or ``strip`` (the default), or for subtitles
     converted from plain text formats. With ``no`` or ``yes`` on ASS
     subtitles, ``--sub-scale`` is ignored and only this factor applies.
+
+    Bitmap secondary subtitles (PGS, DVD, DVB) are scaled as a whole around
+    the bottom center of their bounding box, so they keep their bottom position.
 
 ``--secondary-sub-stack=<yes|no>``
     When both primary and secondary subtitles are shown and overlap vertically,

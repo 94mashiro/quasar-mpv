@@ -17,6 +17,7 @@
 
 #include <stdlib.h>
 #include <assert.h>
+#include <limits.h>
 #include <math.h>
 
 #include <libavcodec/avcodec.h>
@@ -538,6 +539,27 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
             sub->y -= sub->dh * shit;
             sub->dw += sub->dw * shit * 2;
             sub->dh += sub->dh * shit * 2;
+        }
+    }
+
+    // --secondary-sub-scale 对图形副字幕：整组以外包框底边中点为锚缩放，贴底位置不变，
+    // 多块位图之间的相对位置也跟着缩
+    float secondary_scale = sd->order == 1 ? shared_opts->secondary_sub_scale : 1.0f;
+    if (secondary_scale != 1.0f && res->num_parts > 0) {
+        int x0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
+        for (int n = 0; n < res->num_parts; n++) {
+            struct sub_bitmap *sub = &res->parts[n];
+            x0 = MPMIN(x0, sub->x);
+            x1 = MPMAX(x1, sub->x + sub->dw);
+            y1 = MPMAX(y1, sub->y + sub->dh);
+        }
+        float cx = (x0 + x1) / 2.0f;
+        for (int n = 0; n < res->num_parts; n++) {
+            struct sub_bitmap *sub = &res->parts[n];
+            sub->x = lrintf(cx + (sub->x - cx) * secondary_scale);
+            sub->y = lrintf(y1 + (sub->y - y1) * secondary_scale);
+            sub->dw = lrintf(sub->dw * secondary_scale);
+            sub->dh = lrintf(sub->dh * secondary_scale);
         }
     }
 
