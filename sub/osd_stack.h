@@ -58,4 +58,23 @@ static inline int osd_stack_lift(const struct osd_stack_span *pri, int num_pri,
     return dy > 0 ? dy : 0;
 }
 
+// 同一条主字幕显示期间保持副字幕区间，供 osd_stack_lift 当副字幕用：same_pri 为真时把这一帧的副字幕
+// 区间并进 held，为假时 held 只取这一帧的。副字幕先消失或换成矮的一句，held 不缩，主字幕不回落。
+// held 为空时 y0 > y1；osd_stack_hold_num() 给出传给 osd_stack_lift 的 num_sec（0 或 1）。
+static inline void osd_stack_hold(struct osd_stack_span *held, bool same_pri,
+                                  const struct osd_stack_span *sec, int num_sec)
+{
+    if (!same_pri)
+        *held = (struct osd_stack_span){INT_MAX, INT_MIN};
+    for (int n = 0; n < num_sec; n++) {
+        held->y0 = sec[n].y0 < held->y0 ? sec[n].y0 : held->y0;
+        held->y1 = sec[n].y1 > held->y1 ? sec[n].y1 : held->y1;
+    }
+}
+
+static inline int osd_stack_hold_num(const struct osd_stack_span *held)
+{
+    return held->y0 <= held->y1;
+}
+
 #endif

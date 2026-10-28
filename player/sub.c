@@ -70,6 +70,7 @@ void reset_subtitle_state(struct MPContext *mpctx)
     for (int n = 0; n < mpctx->num_tracks; n++)
         reset_subtitles(mpctx, mpctx->tracks[n]);
     term_osd_clear_subs(mpctx);
+    osd_reset_sub_stack(mpctx->osd);
 }
 
 void uninit_sub(struct MPContext *mpctx, struct track *track)

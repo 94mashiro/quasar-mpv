@@ -187,6 +187,7 @@ bool osd_query_and_reset_want_redraw(struct osd_state *osd);
 
 void osd_set_text(struct osd_state *osd, const char *text);
 void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub);
+void osd_reset_sub_stack(struct osd_state *osd);
 
 bool osd_get_render_subs_in_filter(struct osd_state *osd);
 void osd_set_render_subs_in_filter(struct osd_state *osd, bool s);

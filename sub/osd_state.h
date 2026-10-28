@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 
 #include "osd.h"
+#include "osd_stack.h"
 #include "osdep/threads.h"
 
 enum mp_osdtype {
@@ -52,8 +53,11 @@ struct osd_object {
     struct mp_osd_res vo_res;
     bool vo_had_output;
 
-    // OSDTYPE_SUB：上一帧 --secondary-sub-stack 的上移量和移动的 part 数
+    // OSDTYPE_SUB：上一帧 --secondary-sub-stack 的上移量和移动的 part 数；
+    // 上一帧主字幕的 change_id（0 表示不保持）和这条主字幕显示期间保持的副字幕区间
     int stack_dy, stack_lifted;
+    int stack_pri_id;
+    struct osd_stack_span stack_held;
 
     // Internally used by osd_libass.c
     bool changed;

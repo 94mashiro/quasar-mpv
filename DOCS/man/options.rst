@@ -2570,8 +2570,12 @@ Subtitles
     to ``--sub-pos`` but for secondary subtitles.
 
 ``--secondary-sub-scale=<0-100>``
-    Factor for the secondary text subtitle font size, applied on top of
-    ``--sub-scale`` (default: 1). Outline and shadow scale with it.
+    Factor for the secondary text subtitle font size (default: 1). Outline and
+    shadow scale with it. It multiplies ``--sub-scale`` only where
+    ``--sub-scale`` applies, that is with ``--secondary-sub-ass-override``
+    set to ``scale``, ``force`` or ``strip`` (the default), or for subtitles
+    converted from plain text formats. With ``no`` or ``yes`` on ASS
+    subtitles, ``--sub-scale`` is ignored and only this factor applies.
 
 ``--secondary-sub-stack=<yes|no>``
     When both primary and secondary subtitles are shown and overlap vertically,
@@ -2579,6 +2583,8 @@ Subtitles
     above the secondary subtitle (default: no). Use with
     ``--secondary-sub-pos=100`` to put the secondary subtitle at the bottom.
     Bitmaps far from the secondary subtitle (signs, top titles) stay in place.
+    While the same primary subtitle stays on screen, it does not move back
+    down, even if the secondary subtitle ends first or gets shorter.
 
 ``--sub-speed=<0.1-10.0>``
     Multiply the subtitle event timestamps with the given value. Can be used

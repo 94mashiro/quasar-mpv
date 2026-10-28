@@ -220,6 +220,8 @@ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub)
         struct osd_object *obj = osd->objs[OSDTYPE_SUB + index];
         obj->sub = dec_sub;
         obj->vo_change_id += 1;
+        // 换主、副字幕轨都重新保持叠放位移
+        osd->objs[OSDTYPE_SUB]->stack_pri_id = 0;
     }
     osd->want_redraw_notification = true;
     mp_mutex_unlock(&osd->lock);
@@ -357,6 +359,7 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
 }
 
 // --secondary-sub-stack：主、副字幕都有位图时，把主字幕贴底的那一簇抬到副字幕上方。
+// 同一条主字幕显示期间上移量只增不减：副字幕区间按 osd_stack_hold 取并集，副字幕先消失主字幕也不回落。
 // parts 归调用方所有：sd_ass、sd_lavc 都经 sub_bitmaps_copy() 返回新分配的 parts，
 // 改 y 不会影响解码器的缓存，下一帧也不会叠加位移。位图像素不动。
 static void stack_subs(struct osd_state *osd, struct sub_bitmap_list *list)
@@ -369,9 +372,12 @@ static void stack_subs(struct osd_state *osd, struct sub_bitmap_list *list)
             sec = list->items[n];
     }
 
+    struct osd_object *obj = osd->objs[OSDTYPE_SUB];
+    bool stack = osd->opts->secondary_sub_stack && pri;
     int dy = 0, lifted = 0;
-    if (osd->opts->secondary_sub_stack && pri && sec) {
-        int num = pri->num_parts + sec->num_parts;
+    if (stack) {
+        int num_sec = sec ? sec->num_parts : 0;
+        int num = pri->num_parts + num_sec;
         struct osd_stack_span *spans = talloc_array(NULL, struct osd_stack_span, num);
         bool *lift = talloc_array(spans, bool, pri->num_parts);
         for (int n = 0; n < num; n++) {
@@ -379,10 +385,14 @@ static void stack_subs(struct osd_state *osd, struct sub_bitmap_list *list)
                                    : &sec->parts[n - pri->num_parts];
             spans[n] = (struct osd_stack_span){b->y, b->y + b->dh};
         }
+        // render_object 给的 change_id 没变就是同一条主字幕（上一帧这里的加一已记进 stack_pri_id）
+        osd_stack_hold(&obj->stack_held, pri->change_id == obj->stack_pri_id,
+                       spans + pri->num_parts, num_sec);
         // ponytail: 间隙取画面高 1%（约默认字号五分之一行），并簇距离取 5%（约默认字号一行）；
         // 字号调得很大时按实际行高算才准
-        dy = osd_stack_lift(spans, pri->num_parts, spans + pri->num_parts,
-                            sec->num_parts, list->h / 100, list->h / 20, lift);
+        dy = osd_stack_lift(spans, pri->num_parts, &obj->stack_held,
+                            osd_stack_hold_num(&obj->stack_held),
+                            list->h / 100, list->h / 20, lift);
         for (int n = 0; dy && n < pri->num_parts; n++) {
             if (lift[n]) {
                 pri->parts[n].y -= dy;
@@ -394,7 +404,6 @@ static void stack_subs(struct osd_state *osd, struct sub_bitmap_list *list)
 
     // 位移变了而主字幕内容没变时，VO 按 change_id 缓存的旧位置要重画：
     // 单项（gpu 的 osd.c、draw_bmp）和整表（vo_avfoundation）的 change_id 都要变
-    struct osd_object *obj = osd->objs[OSDTYPE_SUB];
     if (dy != obj->stack_dy || lifted != obj->stack_lifted) {
         obj->stack_dy = dy;
         obj->stack_lifted = lifted;
@@ -403,6 +412,16 @@ static void stack_subs(struct osd_state *osd, struct sub_bitmap_list *list)
         if (pri)
             pri->change_id = obj->vo_change_id;
     }
+    // 没开叠放或没有主字幕时记 0（vo_change_id 从 1 起），下次重新保持
+    obj->stack_pri_id = stack ? obj->vo_change_id : 0;
+}
+
+// seek 后重新保持：同一句主字幕重新出现时 change_id 可能不变，这里让下一帧当作换了内容
+void osd_reset_sub_stack(struct osd_state *osd)
+{
+    mp_mutex_lock(&osd->lock);
+    osd->objs[OSDTYPE_SUB]->stack_pri_id = 0;
+    mp_mutex_unlock(&osd->lock);
 }
 
 // Render OSD to a list of bitmap and return it. The returned object is
