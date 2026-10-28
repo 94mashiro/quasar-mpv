@@ -3954,7 +3954,7 @@ static void initiate_refresh_seek(struct demux_internal *in,
             buffered_bytes += get_forward_buffered_bytes(in->streams[n]->ds);
         // A full queue would prevent even the first track read, especially
         // while paused. Keep the existing bounded refill path in that case.
-        bool keep_av = (stream->type == STREAM_AUDIO || stream->type == STREAM_SUB) &&
+        bool keep_queues = (stream->type == STREAM_AUDIO || stream->type == STREAM_SUB) &&
                        !in->back_demuxing &&
                        buffered_bytes < in->max_bytes;
 
@@ -3965,12 +3965,15 @@ static void initiate_refresh_seek(struct demux_internal *in,
             bool correct_dts = ds->queue->correct_dts;
 
             // An audio/subtitle refresh only needs packets for that stream.
-            // Keep the other selected A/V queues readable during preroll.
+            // Keep the other selected queues readable during preroll.
             // Their existing tail is the refresh watermark:
             // add_packet_locked() drops duplicates until it reaches that tail.
             // Using last_ret_* here would append packets already in the queue.
-            if (keep_av && ds != stream && ds->selected && ds->queue->tail &&
-                (ds->type == STREAM_AUDIO || ds->type == STREAM_VIDEO))
+            // Subtitle queues too: the kept A/V queues leave the cached seek
+            // range intact, so a cleared subtitle queue would leave a gap that
+            // a backward cached seek lands in (e.g. enabling secondary-sid
+            // dropped the primary's cues behind the playback position).
+            if (keep_queues && ds != stream && ds->selected && ds->queue->tail)
             {
                 ds->refreshing = true;
                 ds->eof = false;
