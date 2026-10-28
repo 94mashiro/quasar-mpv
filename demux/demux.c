@@ -2092,6 +2092,16 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
 
     struct demux_internal *in = ds->in;
 
+    // Factor/forward seeks start reading at an unknown point at or after the
+    // target. The first packet read tells where.
+    if (in->after_seek && dp->pts != MP_NOPTS_VALUE) {
+        for (int n = 0; n < in->num_streams; n++) {
+            struct demux_stream *s = in->streams[n]->ds;
+            if (s->side_since == INFINITY && !s->side_head)
+                s->side_since = dp->pts;
+        }
+    }
+
     in->after_seek = false;
     in->after_seek_to_start = false;
 
@@ -2541,8 +2551,10 @@ static void execute_seek(struct demux_internal *in)
     in->seeking_in_progress = pts;
     // Reading restarts at or before pts, except for factor/forward seeks.
     double since = flags & (SEEK_FACTOR | SEEK_FORWARD) ? INFINITY : pts;
-    for (int n = 0; n < in->num_streams; n++)
-        side_clear(in->streams[n]->ds, since);
+    for (int n = 0; n < in->num_streams; n++) {
+        struct demux_stream *ds = in->streams[n]->ds;
+        side_clear(ds, ds_cached_unselected(ds) ? since : MP_NOPTS_VALUE);
+    }
     in->demux_ts = MP_NOPTS_VALUE;
     in->low_level_seeks += 1;
     in->after_seek = true;
@@ -4141,8 +4153,9 @@ static bool resume_side_list(struct demux_internal *in, struct demux_stream *ds,
     for (int n = 0; n < in->num_streams; n++)
         ok &= !in->streams[n]->ds->refreshing;
     if (ok) {
+        // Keep cues that started earlier but still show at ref_pts.
         while (ds->side_head && (ds->side_head->pts == MP_NOPTS_VALUE ||
-                                 ds->side_head->pts < ref_pts))
+               ds->side_head->pts + MPMAX(ds->side_head->duration, 0) < ref_pts))
             side_drop_head(ds);
         MP_VERBOSE(in, "track %d resumes from %zu kept bytes\n", ds->index,
                    ds->side_bytes);
@@ -4206,11 +4219,12 @@ void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
     // don't flush buffers if stream is already selected / unselected
     if (ds->selected != selected) {
         MP_VERBOSE(in, "%sselect track %d\n", selected ? "" : "de", stream->index);
+        bool was_cached = ds_cached_unselected(ds);
         ds->selected = selected;
         update_stream_selection_state(in, ds);
         in->tracks_switched = true;
-        if (ds->selected &&
-            !resume_side_list(in, ds, MP_ADD_PTS(ref_pts, -in->ts_offset)))
+        if (ds->selected && !(was_cached &&
+            resume_side_list(in, ds, MP_ADD_PTS(ref_pts, -in->ts_offset))))
             refresh_track(in, stream, ref_pts);
         if (in->threading) {
             mp_cond_signal(&in->wakeup);
@@ -4247,6 +4261,10 @@ bool demux_stream_is_selected(struct sh_stream *stream)
     bool r = false;
     mp_mutex_lock(&stream->ds->in->lock);
     r = stream->ds->selected || ds_cached_unselected(stream->ds);
+    // The demuxer skips this stream's packets now (option off, back
+    // demuxing): the side list loses continuity.
+    if (!r && stream->ds->side_since != MP_NOPTS_VALUE)
+        side_clear(stream->ds, MP_NOPTS_VALUE);
     mp_mutex_unlock(&stream->ds->in->lock);
     return r;
 }
