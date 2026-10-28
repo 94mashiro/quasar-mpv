@@ -2092,16 +2092,6 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
 
     struct demux_internal *in = ds->in;
 
-    // Factor/forward seeks start reading at an unknown point at or after the
-    // target. The first packet read tells where.
-    if (in->after_seek && dp->pts != MP_NOPTS_VALUE) {
-        for (int n = 0; n < in->num_streams; n++) {
-            struct demux_stream *s = in->streams[n]->ds;
-            if (s->side_since == INFINITY && !s->side_head)
-                s->side_since = dp->pts;
-        }
-    }
-
     in->after_seek = false;
     in->after_seek_to_start = false;
 
@@ -2134,15 +2124,19 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
         // Resume reading once the old position was reached (i.e. we start
         // returning packets where we left off before the refresh).
         // If it's the same position, drop, but continue normally next time.
+        // A sparse stream (subtitles) may have no packet at the old position
+        // in the re-read range: keep the first packet past it.
         if (queue->correct_dts) {
             ds->refreshing = dp->dts < queue->last_dts;
+            drop = dp->dts <= queue->last_dts;
         } else if (queue->correct_pos) {
             ds->refreshing = dp->pos < queue->last_pos;
+            drop = dp->pos <= queue->last_pos;
         } else {
             ds->refreshing = false; // should not happen
             MP_WARN(in, "stream %d: demux refreshing failed\n", ds->index);
+            drop = true;
         }
-        drop = true;
     }
 
     if (drop) {
@@ -2550,6 +2544,8 @@ static void execute_seek(struct demux_internal *in)
     in->seeking = false;
     in->seeking_in_progress = pts;
     // Reading restarts at or before pts, except for factor/forward seeks.
+    // ponytail: those leave the side lists unusable until the next exact seek
+    // (the app only seeks exactly); track the first packet read if needed.
     double since = flags & (SEEK_FACTOR | SEEK_FORWARD) ? INFINITY : pts;
     for (int n = 0; n < in->num_streams; n++) {
         struct demux_stream *ds = in->streams[n]->ds;
@@ -4153,10 +4149,17 @@ static bool resume_side_list(struct demux_internal *in, struct demux_stream *ds,
     for (int n = 0; n < in->num_streams; n++)
         ok &= !in->streams[n]->ds->refreshing;
     if (ok) {
-        // Keep cues that started earlier but still show at ref_pts.
-        while (ds->side_head && (ds->side_head->pts == MP_NOPTS_VALUE ||
-               ds->side_head->pts + MPMAX(ds->side_head->duration, 0) < ref_pts))
+        // Keep cues that started earlier but still show at ref_pts. Without a
+        // duration (PGS) a cue shows until the next packet.
+        while (ds->side_head) {
+            struct demux_packet *h = ds->side_head;
+            bool past = h->pts == MP_NOPTS_VALUE ||
+                (h->duration > 0 ? h->pts + h->duration < ref_pts
+                                 : h->next && h->next->pts <= ref_pts);
+            if (!past)
+                break;
             side_drop_head(ds);
+        }
         MP_VERBOSE(in, "track %d resumes from %zu kept bytes\n", ds->index,
                    ds->side_bytes);
         while (ds->side_head) {
@@ -4223,6 +4226,8 @@ void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
         ds->selected = selected;
         update_stream_selection_state(in, ds);
         in->tracks_switched = true;
+        if (ds->selected && !was_cached)
+            side_clear(ds, MP_NOPTS_VALUE);
         if (ds->selected && !(was_cached &&
             resume_side_list(in, ds, MP_ADD_PTS(ref_pts, -in->ts_offset))))
             refresh_track(in, stream, ref_pts);
