@@ -2584,7 +2584,9 @@ Subtitles
     ``--secondary-sub-pos=100`` to put the secondary subtitle at the bottom.
     Bitmaps far from the secondary subtitle (signs, top titles) stay in place.
     While the same primary subtitle stays on screen, it does not move back
-    down, even if the secondary subtitle ends first or gets shorter.
+    down, even if the secondary subtitle ends first or gets shorter. The same
+    subtitle means the same position and size, so fades and karaoke color
+    changes do not count as a new one.
 
 ``--sub-speed=<0.1-10.0>``
     Multiply the subtitle event timestamps with the given value. Can be used

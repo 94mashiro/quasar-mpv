@@ -6,10 +6,11 @@
 
 #include <limits.h>
 #include <stdbool.h>
+#include <string.h>
 
-// 一个位图 part 的竖直区间 [y0, y1)
+// 一个位图 part 的竖直区间 [y0, y1)。x0/x1 是水平区间，只在 osd_stack_frame 判断是不是同一句时用
 struct osd_stack_span {
-    int y0, y1;
+    int y0, y1, x0, x1;
 };
 
 // 算主字幕贴底那一簇要上移多少像素（>= 0），簇里的 part 在 lift[] 里标 true。
@@ -58,23 +59,48 @@ static inline int osd_stack_lift(const struct osd_stack_span *pri, int num_pri,
     return dy > 0 ? dy : 0;
 }
 
-// 同一条主字幕显示期间保持副字幕区间，供 osd_stack_lift 当副字幕用：same_pri 为真时把这一帧的副字幕
-// 区间并进 held，为假时 held 只取这一帧的。副字幕先消失或换成矮的一句，held 不缩，主字幕不回落。
-// held 为空时 y0 > y1；osd_stack_hold_num() 给出传给 osd_stack_lift 的 num_sec（0 或 1）。
-static inline void osd_stack_hold(struct osd_stack_span *held, bool same_pri,
-                                  const struct osd_stack_span *sec, int num_sec)
+// 叠放的保持状态：held 是这一句主字幕显示期间副字幕竖直区间的并集，box 是上一帧主字幕
+// 贴底那一簇抬起前的外包框。valid 为假时下一帧重新开始（换轨、seek、关叠放、没有主字幕）。
+struct osd_stack_hold {
+    bool valid;
+    struct osd_stack_span held, box;
+};
+
+static inline void osd_stack_union(struct osd_stack_span *a, const struct osd_stack_span *b)
 {
-    if (!same_pri)
-        *held = (struct osd_stack_span){INT_MAX, INT_MIN};
-    for (int n = 0; n < num_sec; n++) {
-        held->y0 = sec[n].y0 < held->y0 ? sec[n].y0 : held->y0;
-        held->y1 = sec[n].y1 > held->y1 ? sec[n].y1 : held->y1;
-    }
+    a->y0 = b->y0 < a->y0 ? b->y0 : a->y0;
+    a->y1 = b->y1 > a->y1 ? b->y1 : a->y1;
+    a->x0 = b->x0 < a->x0 ? b->x0 : a->x0;
+    a->x1 = b->x1 > a->x1 ? b->x1 : a->x1;
 }
 
-static inline int osd_stack_hold_num(const struct osd_stack_span *held)
+// 一帧的叠放位移，参数和返回值同 osd_stack_lift。先当作还是同一句，用 held 并上这一帧的副字幕
+// 算出要抬的簇；簇的外包框和上一帧一样就是同一句，held 留着并集，副字幕先结束或变矮主字幕也不回落。
+// 框变了（换句、行数或宽度变）就只按这一帧的副字幕重算。只比几何不比内容：\fad 淡入淡出、
+// \k 卡拉 OK 只改颜色、透明度或把一行拆成几段，框不变。
+static inline int osd_stack_frame(struct osd_stack_hold *st,
+                                  const struct osd_stack_span *pri, int num_pri,
+                                  const struct osd_stack_span *sec, int num_sec,
+                                  int gap, int join, bool *lift)
 {
-    return held->y0 <= held->y1;
+    const struct osd_stack_span empty = {INT_MAX, INT_MIN, INT_MAX, INT_MIN};
+    struct osd_stack_span held = st->valid ? st->held : empty;
+    for (int pass = 0;; pass++) {
+        for (int n = 0; n < num_sec; n++)
+            osd_stack_union(&held, &sec[n]);
+        int dy = osd_stack_lift(pri, num_pri, &held, held.y0 <= held.y1,
+                                gap, join, lift);
+        struct osd_stack_span box = empty;
+        for (int n = 0; n < num_pri; n++) {
+            if (lift[n])
+                osd_stack_union(&box, &pri[n]);
+        }
+        if (pass || (st->valid && !memcmp(&box, &st->box, sizeof(box)))) {
+            *st = (struct osd_stack_hold){true, held, box};
+            return dy;
+        }
+        held = empty;
+    }
 }
 
 #endif
