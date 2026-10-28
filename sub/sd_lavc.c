@@ -69,6 +69,9 @@ struct sd_lavc_priv {
     int64_t new_id;
     struct mp_image_params video_params;
     double current_pts;
+    // After reset, renders may still use a pre-seek frame's pts until the
+    // player reports the new video pts. Don't let them advance current_pts.
+    bool wait_video_pts;
     struct seekpoint *seekpoints;
     int num_seekpoints;
     struct bitmap_packer *packer;
@@ -445,7 +448,8 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
     struct mp_subtitle_opts *opts = sd->opts;
     struct mp_subtitle_shared_opts *shared_opts = sd->shared_opts;
 
-    priv->current_pts = pts;
+    if (!priv->wait_video_pts)
+        priv->current_pts = pts;
 
     struct sub *current = get_current(priv, pts);
 
@@ -614,6 +618,7 @@ static bool accepts_packet(struct sd *sd, double min_pts)
 
     double pts = priv->current_pts;
     if (min_pts != MP_NOPTS_VALUE) {
+        priv->wait_video_pts = false;
         // guard against bogus rendering PTS in the future.
         if (pts == MP_NOPTS_VALUE || min_pts < pts)
             pts = min_pts;
@@ -650,6 +655,7 @@ static void reset(struct sd *sd)
     avcodec_flush_buffers(priv->avctx);
 
     priv->current_pts = MP_NOPTS_VALUE;
+    priv->wait_video_pts = true;
 }
 
 static void uninit(struct sd *sd)
