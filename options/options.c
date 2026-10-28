@@ -381,6 +381,7 @@ const struct m_sub_options mp_subtitle_shared_sub_opts = {
         {"secondary-sub-delay", OPT_FLOAT(sub_delay[1])},
         {"sub-pos", OPT_FLOAT(sub_pos[0]), M_RANGE(0.0, 150.0)},
         {"secondary-sub-pos", OPT_FLOAT(sub_pos[1]), M_RANGE(0.0, 150.0)},
+        {"secondary-sub-scale", OPT_FLOAT(secondary_sub_scale), M_RANGE(0, 100)},
         {"sub-visibility", OPT_BOOL(sub_visibility[0])},
         {"secondary-sub-visibility", OPT_BOOL(sub_visibility[1])},
         {"sub-ass-override", OPT_CHOICE(ass_style_override[0],
@@ -406,6 +407,7 @@ const struct m_sub_options mp_subtitle_shared_sub_opts = {
         .sub_pos[0] = 100,
         .ass_style_override[0] = ASS_STYLE_OVERRIDE_SCALE,
         .ass_style_override[1] = ASS_STYLE_OVERRIDE_STRIP,
+        .secondary_sub_scale = 1,
     },
     .change_flags = UPDATE_OSD,
 };

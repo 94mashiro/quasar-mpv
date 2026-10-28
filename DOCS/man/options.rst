@@ -2569,6 +2569,10 @@ Subtitles
     Specify the position of secondary subtitles on the screen. This is similar
     to ``--sub-pos`` but for secondary subtitles.
 
+``--secondary-sub-scale=<0-100>``
+    Factor for the secondary text subtitle font size, applied on top of
+    ``--sub-scale`` (default: 1). Outline and shadow scale with it.
+
 ``--sub-speed=<0.1-10.0>``
     Multiply the subtitle event timestamps with the given value. Can be used
     to fix the playback speed for frame-based subtitle formats. Affects text
