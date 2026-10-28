@@ -480,7 +480,8 @@ static bool ds_cached_unselected(struct demux_stream *ds)
     struct demux_internal *in = ds->in;
     return !ds->selected && ds->type == STREAM_SUB && !ds->ignore_eof &&
            in->num_streams > 1 && in->d_thread->desc == &demuxer_desc_matroska &&
-           !in->back_demuxing && in->d_user->opts->cache_unselected_subs;
+           in->threading && !in->back_demuxing &&
+           in->d_user->opts->cache_unselected_subs;
 }
 
 // Window and total size of the side lists. Readahead is up to ~30 s ahead of
@@ -983,7 +984,10 @@ static void update_stream_selection_state(struct demux_internal *in,
         in->blocked = false;
 
     ds_clear_reader_state(ds, true);
-    side_clear(ds, MP_NOPTS_VALUE);
+    // Deselected: collect from the next packet on. Selected: resume_side_list()
+    // consumes the list.
+    if (!ds->selected)
+        side_clear(ds, MP_NOPTS_VALUE);
 
     // Make sure any stream reselection or addition is reflected in the seek
     // ranges, and also get rid of data that is not needed anymore (or
@@ -2132,6 +2136,10 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
     }
 
     if (drop) {
+        // A dropped packet (option turned off, back demuxing, seeking) breaks
+        // the side list's continuity.
+        if (!ds->selected)
+            side_clear(ds, MP_NOPTS_VALUE);
         demux_packet_pool_push(in->packet_pool, dp);
         return;
     }
@@ -2531,8 +2539,10 @@ static void execute_seek(struct demux_internal *in)
     in->eof = false;
     in->seeking = false;
     in->seeking_in_progress = pts;
+    // Reading restarts at or before pts, except for factor/forward seeks.
+    double since = flags & (SEEK_FACTOR | SEEK_FORWARD) ? INFINITY : pts;
     for (int n = 0; n < in->num_streams; n++)
-        side_clear(in->streams[n]->ds, pts);
+        side_clear(in->streams[n]->ds, since);
     in->demux_ts = MP_NOPTS_VALUE;
     in->low_level_seeks += 1;
     in->after_seek = true;
@@ -4131,8 +4141,8 @@ static bool resume_side_list(struct demux_internal *in, struct demux_stream *ds,
     for (int n = 0; n < in->num_streams; n++)
         ok &= !in->streams[n]->ds->refreshing;
     if (ok) {
-        while (ds->side_head && ds->side_head->pts != MP_NOPTS_VALUE &&
-               ds->side_head->pts < ref_pts)
+        while (ds->side_head && (ds->side_head->pts == MP_NOPTS_VALUE ||
+                                 ds->side_head->pts < ref_pts))
             side_drop_head(ds);
         MP_VERBOSE(in, "track %d resumes from %zu kept bytes\n", ds->index,
                    ds->side_bytes);
