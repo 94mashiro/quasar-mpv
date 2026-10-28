@@ -3492,7 +3492,8 @@ static void demux_mkv_seek(demuxer_t *demuxer, double seek_pts, int flags)
     mkv_seek_reset(demuxer);
     for (int i = 0; i < mkv_d->num_tracks; i++) {
         mkv_track_t *track = mkv_d->tracks[i];
-        if (demux_stream_is_selected(track->stream)) {
+        if (demux_stream_is_selected(track->stream) &&
+            !demux_stream_is_cached_only(track->stream)) {
             st_active[track->stream->type] = true;
             if (track->type == MATROSKA_TRACK_VIDEO)
                 v_tnum = track->tnum;

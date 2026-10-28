@@ -101,6 +101,7 @@ const struct m_sub_options demux_conf = {
         {"demuxer-max-back-bytes", OPT_BYTE_SIZE(max_bytes_bw),
             M_RANGE(0, M_MAX_MEM_BYTES)},
         {"demuxer-donate-buffer", OPT_BOOL(donate_fw)},
+        {"demuxer-cache-unselected-subs", OPT_BOOL(cache_unselected_subs)},
         {"force-seekable", OPT_BOOL(force_seekable)},
         {"cache-secs", OPT_DOUBLE(min_secs_cache), M_RANGE(0, DBL_MAX)},
         {"access-references", OPT_BOOL(access_references)},
@@ -245,6 +246,7 @@ struct demux_internal {
     int num_ranges;
 
     size_t total_bytes;         // total sum of packet data buffered
+    size_t side_bytes;          // sum over ds->side_* (not in total_bytes)
     // Range from which decoder is reading, and to which demuxer is appending.
     // This is normally never NULL. This is always ranges[num_ranges - 1].
     // This is can be NULL during initialization or deinitialization.
@@ -387,6 +389,12 @@ struct demux_stream {
     // reader (decoder) state (bitrate calculations are part of it because we
     // want to return the bitrate closest to the "current position")
     double base_ts;         // timestamp of the last packet returned to decoder
+    // --demuxer-cache-unselected-subs: packets of this unselected subtitle
+    // stream, kept outside the cache queues. side_since: every packet with
+    // pts >= it since then is in the list.
+    struct demux_packet *side_head, *side_tail;
+    size_t side_bytes;
+    double side_since;
     double last_br_ts;      // timestamp of last packet bitrate was calculated
     size_t last_br_bytes;   // summed packet sizes since last bitrate calculation
     double bitrate;
@@ -440,6 +448,7 @@ static void demuxer_sort_chapters(demuxer_t *demuxer);
 static MP_THREAD_VOID demux_thread(void *pctx);
 static void update_cache(struct demux_internal *in);
 static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp);
+static void enqueue_packet(struct demux_stream *ds, demux_packet_t *dp, double ts);
 static struct demux_packet *advance_reader_head(struct demux_stream *ds);
 static bool queue_seek(struct demux_internal *in, double seek_pts, int flags,
                        bool clear_back_state);
@@ -458,6 +467,82 @@ static uint64_t get_forward_buffered_bytes(struct demux_stream *ds)
     if (!ds->reader_head)
         return 0;
     return ds->queue->tail_cum_pos - ds->reader_head->cum_pos;
+}
+
+// --demuxer-cache-unselected-subs: in Matroska, subtitle blocks are
+// interleaved with A/V and read anyway. Keep the unselected ones in a small
+// per-stream side list, outside the cache queues and their seek/refresh
+// bookkeeping, so selecting the track needs no refresh seek. Not for other
+// demuxers (lavf would fetch separate HLS/DASH subtitle renditions), external
+// single-stream files, CC tracks (fed by the video decoder), or back demuxing.
+static bool ds_cached_unselected(struct demux_stream *ds)
+{
+    struct demux_internal *in = ds->in;
+    return !ds->selected && ds->type == STREAM_SUB && !ds->ignore_eof &&
+           in->num_streams > 1 && in->d_thread->desc == &demuxer_desc_matroska &&
+           !in->back_demuxing && in->d_user->opts->cache_unselected_subs;
+}
+
+// Window and total size of the side lists. Readahead is up to ~30 s ahead of
+// playback, and a switch reads from 10 s before it.
+#define SIDE_SECS 60
+#define SIDE_MAX_BYTES (16 * 1024 * 1024)
+
+static void side_drop_head(struct demux_stream *ds)
+{
+    struct demux_packet *dp = ds->side_head;
+    ds->side_head = dp->next;
+    if (!ds->side_head)
+        ds->side_tail = NULL;
+    size_t bytes = demux_packet_estimate_total_size(dp);
+    ds->side_bytes -= bytes;
+    ds->in->side_bytes -= bytes;
+    if (dp->pts != MP_NOPTS_VALUE)
+        ds->side_since = MP_PTS_MAX(ds->side_since, dp->pts + 1e-6);
+    dp->next = NULL;
+    demux_packet_pool_push(ds->in->packet_pool, dp);
+}
+
+static void side_clear(struct demux_stream *ds, double since)
+{
+    while (ds->side_head)
+        side_drop_head(ds);
+    ds->side_since = since;
+}
+
+static void side_append(struct demux_stream *ds, struct demux_packet *dp)
+{
+    struct demux_internal *in = ds->in;
+    // A re-read (refresh seek) restarts the list: it must stay in file order.
+    if (ds->side_tail && (dp->pos < 0 || dp->pos <= ds->side_tail->pos))
+        side_clear(ds, dp->pts == MP_NOPTS_VALUE ? INFINITY : dp->pts);
+    if (ds->side_since == MP_NOPTS_VALUE)
+        ds->side_since = dp->pts == MP_NOPTS_VALUE ? INFINITY : dp->pts;
+    size_t bytes = demux_packet_estimate_total_size(dp);
+    ds->side_bytes += bytes;
+    in->side_bytes += bytes;
+    if (ds->side_tail)
+        ds->side_tail->next = dp;
+    else
+        ds->side_head = dp;
+    ds->side_tail = dp;
+
+    double now = in->demux_ts;
+    while (ds->side_head && now != MP_NOPTS_VALUE &&
+           ds->side_head->pts != MP_NOPTS_VALUE &&
+           ds->side_head->pts < now - SIDE_SECS)
+        side_drop_head(ds);
+    while (in->side_bytes > SIDE_MAX_BYTES) {
+        struct demux_stream *oldest = NULL;
+        for (int n = 0; n < in->num_streams; n++) {
+            struct demux_stream *s = in->streams[n]->ds;
+            if (s->side_head && (!oldest || s->side_head->pts < oldest->side_head->pts))
+                oldest = s;
+        }
+        if (!oldest)
+            break;
+        side_drop_head(oldest);
+    }
 }
 
 #if 0
@@ -898,6 +983,7 @@ static void update_stream_selection_state(struct demux_internal *in,
         in->blocked = false;
 
     ds_clear_reader_state(ds, true);
+    side_clear(ds, MP_NOPTS_VALUE);
 
     // Make sure any stream reselection or addition is reflected in the seek
     // ranges, and also get rid of data that is not needed anymore (or
@@ -2014,6 +2100,11 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
 
     struct demux_queue *queue = ds->queue;
 
+    if (!ds->selected && !in->seeking && ds_cached_unselected(ds)) {
+        side_append(ds, dp);
+        return;
+    }
+
     bool drop = !ds->selected || in->seeking || ds->sh->attached_picture;
 
     if (!drop) {
@@ -2044,6 +2135,15 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
         demux_packet_pool_push(in->packet_pool, dp);
         return;
     }
+
+    enqueue_packet(ds, dp, ts);
+}
+
+// Append a packet that passed the drop/refresh checks to the stream's queue.
+static void enqueue_packet(struct demux_stream *ds, demux_packet_t *dp, double ts)
+{
+    struct demux_internal *in = ds->in;
+    struct demux_queue *queue = ds->queue;
 
     record_packet(in, dp);
 
@@ -2092,7 +2192,7 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
 
     // For video, PTS determination is not trivial, but for other media types
     // distinguishing PTS and DTS is not useful.
-    if (stream->type != STREAM_VIDEO && dp->pts == MP_NOPTS_VALUE)
+    if (ds->type != STREAM_VIDEO && dp->pts == MP_NOPTS_VALUE)
         dp->pts = dp->dts;
 
     if (ts != MP_NOPTS_VALUE && (ts > queue->last_ts || ts + 10 < queue->last_ts))
@@ -2103,7 +2203,7 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
     const char *num_pkts = queue->head == queue->tail ? "1" : ">1";
     uint64_t fw_bytes = get_forward_buffered_bytes(ds);
     MP_TRACE(in, "append packet to %s: size=%zu pts=%f dts=%f pos=%"PRIi64" "
-             "[num=%s size=%zd]\n", stream_type_name(stream->type),
+             "[num=%s size=%zd]\n", stream_type_name(ds->type),
              dp->len, dp->pts, dp->dts, dp->pos, num_pkts, (size_t)fw_bytes);
 
     adjust_seek_range_on_packet(ds, dp);
@@ -2112,12 +2212,12 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
     prune_old_packets(in);
 
     // Possibly update duration based on highest TS demuxed (but ignore subs).
-    if (stream->type != STREAM_SUB) {
+    if (ds->type != STREAM_SUB) {
         // FFmpeg's animated WebP demuxer supplies per-frame durations but no
         // stream duration. Include the final frame's display interval instead
         // of reporting only its starting timestamp as the animation length.
-        if (stream->type == STREAM_VIDEO &&
-            strcmp(stream->codec->codec, "webp_anim") == 0 &&
+        if (ds->type == STREAM_VIDEO &&
+            strcmp(ds->sh->codec->codec, "webp_anim") == 0 &&
             ts != MP_NOPTS_VALUE && dp->duration > 0 &&
             isfinite(dp->duration) && isfinite(ts + dp->duration))
             ts += dp->duration;
@@ -2431,6 +2531,8 @@ static void execute_seek(struct demux_internal *in)
     in->eof = false;
     in->seeking = false;
     in->seeking_in_progress = pts;
+    for (int n = 0; n < in->num_streams; n++)
+        side_clear(in->streams[n]->ds, pts);
     in->demux_ts = MP_NOPTS_VALUE;
     in->low_level_seeks += 1;
     in->after_seek = true;
@@ -3547,6 +3649,7 @@ void demux_flush(demuxer_t *demuxer)
         struct demux_stream *ds = in->streams[n]->ds;
         ds->refreshing = false;
         ds->eof = false;
+        side_clear(ds, MP_NOPTS_VALUE);
     }
     in->eof = false;
     in->seeking = false;
@@ -4015,6 +4118,39 @@ static void initiate_refresh_seek(struct demux_internal *in,
 }
 
 // Called locked.
+// A subtitle stream just selected with --demuxer-cache-unselected-subs: move
+// its side list into the queue instead of a refresh seek, if the list holds
+// every packet from ref_pts on (10 s before the playback position, see
+// reselect_demux_stream()) and no seek or refresh is moving the demuxer.
+static bool resume_side_list(struct demux_internal *in, struct demux_stream *ds,
+                             double ref_pts)
+{
+    bool ok = ref_pts != MP_NOPTS_VALUE && ds->side_since != MP_NOPTS_VALUE &&
+              ds->side_since <= ref_pts && !ds->queue->head && !in->seeking &&
+              in->seeking_in_progress == MP_NOPTS_VALUE;
+    for (int n = 0; n < in->num_streams; n++)
+        ok &= !in->streams[n]->ds->refreshing;
+    if (ok) {
+        while (ds->side_head && ds->side_head->pts != MP_NOPTS_VALUE &&
+               ds->side_head->pts < ref_pts)
+            side_drop_head(ds);
+        MP_VERBOSE(in, "track %d resumes from %zu kept bytes\n", ds->index,
+                   ds->side_bytes);
+        while (ds->side_head) {
+            struct demux_packet *dp = ds->side_head;
+            ds->side_head = dp->next;
+            size_t bytes = demux_packet_estimate_total_size(dp);
+            ds->side_bytes -= bytes;
+            in->side_bytes -= bytes;
+            dp->next = NULL;
+            enqueue_packet(ds, dp, dp->dts == MP_NOPTS_VALUE ? dp->pts : dp->dts);
+        }
+        ds->side_tail = NULL;
+    }
+    side_clear(ds, MP_NOPTS_VALUE);
+    return ok;
+}
+
 static void refresh_track(struct demux_internal *in, struct sh_stream *stream,
                           double ref_pts)
 {
@@ -4063,7 +4199,8 @@ void demuxer_select_track(struct demuxer *demuxer, struct sh_stream *stream,
         ds->selected = selected;
         update_stream_selection_state(in, ds);
         in->tracks_switched = true;
-        if (ds->selected)
+        if (ds->selected &&
+            !resume_side_list(in, ds, MP_ADD_PTS(ref_pts, -in->ts_offset)))
             refresh_track(in, stream, ref_pts);
         if (in->threading) {
             mp_cond_signal(&in->wakeup);
@@ -4099,7 +4236,19 @@ bool demux_stream_is_selected(struct sh_stream *stream)
         return false;
     bool r = false;
     mp_mutex_lock(&stream->ds->in->lock);
-    r = stream->ds->selected;
+    r = stream->ds->selected || ds_cached_unselected(stream->ds);
+    mp_mutex_unlock(&stream->ds->in->lock);
+    return r;
+}
+
+// Packets are delivered only for --demuxer-cache-unselected-subs; the player
+// does not read the stream. Seek heuristics should treat it as unselected.
+bool demux_stream_is_cached_only(struct sh_stream *stream)
+{
+    if (!stream)
+        return false;
+    mp_mutex_lock(&stream->ds->in->lock);
+    bool r = ds_cached_unselected(stream->ds);
     mp_mutex_unlock(&stream->ds->in->lock);
     return r;
 }
