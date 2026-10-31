@@ -218,6 +218,29 @@ static CTFontRef with_traits(CTFontRef f, double em, bool bold, bool italic, boo
     return out;
 }
 
+static double cap_height(CTFontRef f)
+{
+    return CTFontGetCapHeight(f);
+}
+
+// f at the em size where measure() reads target px. The system font picks
+// its optical variant (and CJK fallback) by size, so measure at the size
+// used and correct once.
+static CTFontRef sized(CTFontRef f, double em, double target, double (*measure)(CTFontRef),
+                       bool bold, bool italic, bool *fake_bold)
+{
+    CTFontRef out = with_traits(f, em, bold, italic, fake_bold);
+    double got = out ? measure(out) : 0;
+    if (got > 0 && fabs(got - target) > target * 0.005) {
+        CTFontRef again = with_traits(f, em * target / got, bold, italic, fake_bold);
+        if (again) {
+            CFRelease(out);
+            out = again;
+        }
+    }
+    return out;
+}
+
 struct fonts {
     CTFontRef latin, cjk;   // the same font when the main font has CJK
     bool fake_bold_latin, fake_bold_cjk;
@@ -254,8 +277,9 @@ static struct fonts make_fonts(const char *family, const char *cjk_family,
         return out;
     }
     double ratio = hanzi_height(cjk ? cjk : sys);    // at 1 pt
-    double cjk_em = px * REF_HANZI / (REF_ASCENT + REF_DESCENT) / (ratio > 0 ? ratio : REF_HANZI);
-    out.cjk = with_traits(cjk ? cjk : sys, cjk_em, bold, italic, &out.fake_bold_cjk);
+    double ink = px * REF_HANZI / (REF_ASCENT + REF_DESCENT);
+    double cjk_em = ink / (ratio > 0 ? ratio : REF_HANZI);
+    out.cjk = sized(cjk ? cjk : sys, cjk_em, ink, hanzi_height, bold, italic, &out.fake_bold_cjk);
     if ((main && cjk == main) || (!main && !cjk)) {
         // One font for both: the main font has CJK, or the system pair
         // (one run, so CoreText adds its own CJK-Latin spacing).
@@ -265,8 +289,13 @@ static struct fonts make_fonts(const char *family, const char *cjk_family,
         CTFontRef latin = main ? main : sys;
         double hanzi = out.cjk ? hanzi_height(out.cjk) : 0;
         double cap = CTFontGetCapHeight(latin);
-        double em = hanzi > 0 && cap > 0 ? system_cap_ratio() * hanzi / cap : cjk_em;
-        out.latin = with_traits(latin, em, bold, italic, &out.fake_bold_latin);
+        if (hanzi > 0 && cap > 0) {
+            double target = system_cap_ratio() * hanzi;
+            out.latin = sized(latin, target / cap, target, cap_height, bold, italic,
+                              &out.fake_bold_latin);
+        } else {
+            out.latin = with_traits(latin, cjk_em, bold, italic, &out.fake_bold_latin);
+        }
     }
     if (main)
         CFRelease(main);
