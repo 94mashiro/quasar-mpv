@@ -23,6 +23,7 @@
 #include <IOSurface/IOSurfaceRef.h>
 
 #include "vo_avfoundation_priv.h"
+#include "avfoundation_osd_size.h"
 
 void avf_update_avfoundation_geometry(struct vo *vo)
 {
@@ -111,6 +112,26 @@ static bool avf_map_subtitle_rect(struct avf_render_geometry geometry,
 }
 // --- end avf frame-space osd core ---
 
+// Subtitle layer: screen-resolution OSD in the video rect (see
+// avf_layer_osd_size). Square pixels, so display_par is 1; libass applies the
+// video PAR to ASS itself, as for a window-sized OSD.
+static struct avf_render_geometry avf_layer_space_geometry(struct priv *p,
+                                                          int frame_w, int frame_h,
+                                                          int p_w, int p_h)
+{
+    int ow, oh;
+    if (!avf_layer_osd_size(p->render_layer_w, p->render_layer_h, frame_w, frame_h,
+                            p_w, p_h, &ow, &oh))
+        return (struct avf_render_geometry){0};
+    return (struct avf_render_geometry){
+        .w = ow,
+        .h = oh,
+        .src = {0, 0, frame_w, frame_h},
+        .dst = {0, 0, ow, oh},
+        .osd_res = {.w = ow, .h = oh, .display_par = 1.0},
+    };
+}
+
 static struct avf_render_geometry compute_render_geometry(struct vo *vo,
                                                           int frame_w,
                                                           int frame_h)
@@ -123,6 +144,14 @@ static struct avf_render_geometry compute_render_geometry(struct vo *vo,
         frame_w = vo->params ? vo->params->w : 0;
     if (frame_h <= 0)
         frame_h = vo->params ? vo->params->h : 0;
+
+    if (should_use_inline_osd_layer(p) && p->osdLayer) {
+        struct avf_render_geometry g = avf_layer_space_geometry(p, frame_w, frame_h,
+            vo->params ? vo->params->p_w : 1, vo->params ? vo->params->p_h : 1);
+        // Before the first attach on main the size is unknown; frame space.
+        if (g.w > 0)
+            return g;
+    }
 
     if (should_use_frame_space_osd(p)) {
         return avf_frame_space_geometry(frame_w, frame_h,
@@ -178,7 +207,36 @@ static void update_render_geometry(struct vo *vo, int frame_w, int frame_h)
 
     avf_update_avfoundation_geometry(vo);
     p->render_geometry = compute_render_geometry(vo, frame_w, frame_h);
+    p->render_geometry_inline = should_use_inline_osd_layer(p) && p->osdLayer;
     p->render_geometry_valid = true;
+}
+
+// Adopt the subtitle layer's pixel size: the first one at once, later ones
+// after they held for 150 ms while playing (no relayout per frame of a
+// rotation or window drag), at once when paused (one redraw per change, see
+// avf_check_osd_layer_resize). Returns true when the size in use changed.
+static bool adopt_layer_size(struct priv *p)
+{
+    int lw = 0, lh = 0;
+    [p->osdLayer getPixelWidth:&lw height:&lh];
+    if (lw == p->render_layer_w && lh == p->render_layer_h) {
+        // Back to the size in use: drop a pending one.
+        p->pending_layer_w = lw;
+        p->pending_layer_h = lh;
+        return false;
+    }
+    int64_t now = mp_time_ns();
+    if (lw != p->pending_layer_w || lh != p->pending_layer_h) {
+        p->pending_layer_w = lw;
+        p->pending_layer_h = lh;
+        p->pending_layer_since_ns = now;
+    }
+    if (p->render_layer_w > 0 && !p->playback_paused &&
+        now - p->pending_layer_since_ns < MP_TIME_MS_TO_NS(150))
+        return false;
+    p->render_layer_w = lw;
+    p->render_layer_h = lh;
+    return true;
 }
 
 static struct avf_render_geometry get_render_geometry(struct vo *vo,
@@ -187,10 +245,36 @@ static struct avf_render_geometry get_render_geometry(struct vo *vo,
 {
     struct priv *p = vo->priv;
 
-    if (!p->render_geometry_valid || should_apply_video_geometry(vo))
+    bool inline_layer = should_use_inline_osd_layer(p) && p->osdLayer;
+    bool layer_resized = inline_layer && adopt_layer_size(p);
+    if (!p->render_geometry_valid || layer_resized ||
+        inline_layer != p->render_geometry_inline || should_apply_video_geometry(vo))
         update_render_geometry(vo, frame_w, frame_h);
 
     return p->render_geometry;
+}
+
+void avf_check_osd_layer_resize(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    if (!p->playback_paused) {
+        // Playing: frames adopt the size; a later paused resize asks anew.
+        p->redraw_layer_w = p->redraw_layer_h = 0;
+        return;
+    }
+    // Nothing on screen to re-lay out: the next cue renders at the new size.
+    if (!p->osdLayer || p->presentation_host || !should_use_inline_osd_layer(p) ||
+        !(p->has_subtitle || p->osd_frame_dropped))
+        return;
+    int lw = 0, lh = 0;
+    [p->osdLayer getPixelWidth:&lw height:&lh];
+    if (lw <= 0 || lh <= 0 || (lw == p->render_layer_w && lh == p->render_layer_h) ||
+        (lw == p->redraw_layer_w && lh == p->redraw_layer_h))
+        return;
+    // Once per size, so a redraw that renders nothing cannot loop.
+    p->redraw_layer_w = lw;
+    p->redraw_layer_h = lh;
+    vo->want_redraw = true;
 }
 
 // Sync OSD and display layer frames.
@@ -926,78 +1010,35 @@ static CVPixelBufferRef render_subtitle_pixel_buffer(struct vo *vo,
     return pixbuf;
 }
 
-CMSampleBufferRef avf_create_osd_sample_buffer(struct vo *vo,
-                                                  int64_t media_pts_ns,
-                                                  bool *needed)
+QuasarSubtitleFrame *avf_create_osd_frame(struct vo *vo, bool *needed)
 {
     struct priv *p = vo->priv;
 
-    if (needed)
-        *needed = false;
-
-    if (!should_use_inline_osd_layer(p) || !p->osd_needs_enqueue)
-        return NULL;
-
-    if (needed)
-        *needed = true;
-
-    CVPixelBufferRef pixbuf = NULL;
-    if (p->has_subtitle && p->cachedSubtitleBuffer) {
-        pixbuf = CVPixelBufferRetain(p->cachedSubtitleBuffer);
-    } else {
-        pixbuf = create_empty_osd_pixel_buffer(vo);
-    }
-    if (!pixbuf)
-        return NULL;
-
-    CMSampleTimingInfo info = {
-        .presentationTimeStamp = cm_time_from_ns(media_pts_ns),
-        .duration = kCMTimeInvalid,
-        .decodeTimeStamp = kCMTimeInvalid
-    };
-
-    CMFormatDescriptionRef format = NULL;
-    CMSampleBufferRef buf = NULL;
-    OSStatus err = CMVideoFormatDescriptionCreateForImageBuffer(NULL, pixbuf, &format);
-    if (err == noErr && format)
-        err = CMSampleBufferCreateReadyWithImageBuffer(NULL, pixbuf, format, &info, &buf);
-
-    if (format)
-        CFRelease(format);
-    CVPixelBufferRelease(pixbuf);
-
-    if (err != noErr || !buf) {
-        MP_ERR(vo, "Failed to create OSD sample buffer: %d\n", (int)err);
-        return NULL;
-    }
-
-    // Same rule as video: a stopped timebase cannot pass an equal-PTS
-    // replacement, so paused cue changes display immediately.
-    // ponytail: no pixel-aspect attachment; Dolby Vision is square-pixel.
-    if (p->playback_paused && !p->presentation_host) {
-        CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(buf, true);
-        if (attachments && CFArrayGetCount(attachments) > 0) {
-            CFDictionarySetValue((CFMutableDictionaryRef)
-                CFArrayGetValueAtIndex(attachments, 0),
-                kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
-        }
-    }
-
-    return buf;
+    *needed = should_use_inline_osd_layer(p) && p->osd_needs_enqueue;
+    if (!*needed)
+        return nil;
+    if (p->has_subtitle && p->cachedSubtitleFrame)
+        return [p->cachedSubtitleFrame retain];
+    return [[QuasarSubtitleFrame alloc] init];
 }
 
-bool avf_enqueue_osd_sample(struct vo *vo, CMSampleBufferRef buf)
+bool avf_enqueue_osd_frame(struct vo *vo, QuasarSubtitleFrame *frame,
+                           int64_t media_pts_ns)
 {
     struct priv *p = vo->priv;
 
-    if (!buf)
+    if (!frame)
         return true;
-
     if (!p->osdLayer)
         return false;
-    [p->osdLayer enqueueSampleBuffer:buf];
+    // Same rule as video: a stopped timebase cannot pass an equal-PTS
+    // replacement, so paused cue changes display immediately.
+    [p->osdLayer enqueueFrame:frame pts:media_pts_ns
+                    immediate:p->playback_paused && !p->presentation_host];
     return true;
 }
+
+static bool render_osd_buffer(struct vo *vo, struct sub_bitmap_list *list);
 
 // Composite all OSD groups in order into one cache. Combined change_id tracks
 // group removal; per-callback caching loses subtitles beside independent
@@ -1020,7 +1061,11 @@ static bool render_osd_with_geometry(struct vo *vo, double pts,
         [SUBBITMAP_LIBASS] = true,
     };
     struct sub_bitmap_list *list = osd_render(vo->osd, p->osd_res, pts, 0, formats);
-    if (list->change_id == p->osd_change_id && p->cachedSubtitleBuffer) {
+    bool inline_layer = should_use_inline_osd_layer(p);
+    bool changed = list->change_id != p->osd_change_id ||
+        !(inline_layer ? p->cachedSubtitleFrame || p->osd_frame_dropped
+                       : p->cachedSubtitleBuffer);
+    if (!changed) {
         p->perf.skipped++;
         talloc_free(list);
         return true;
@@ -1034,11 +1079,45 @@ static bool render_osd_with_geometry(struct vo *vo, double pts,
         talloc_free(list);
         return true;
     }
+    int64_t start = mp_time_ns();
+    // Subtitle layer: keep only the parts' pixels; the layer composites them.
+    if (inline_layer) {
+        QuasarSubtitleFrame *frame = [[QuasarSubtitleFrame alloc] initWithList:list];
+        if (!frame || frame->_count < 0) {
+            MP_WARN(vo, "Subtitle frame dropped: %s\n", frame && frame->_bytes == 0 &&
+                    frame->_pixelsOffset == 0 ? "over the size limit" : "out of memory");
+            [frame release];
+            // Not retried until the subtitle changes.
+            p->osd_change_id = list->change_id;
+            p->osd_frame_dropped = true;
+            p->osd_needs_enqueue = clear_pending;
+            talloc_free(list);
+            return false;
+        }
+        p->cachedSubtitleFrame = frame;
+    } else if (!render_osd_buffer(vo, list)) {
+        talloc_free(list);
+        return false;
+    }
+    p->osd_change_id = list->change_id;
+    p->has_subtitle = true;
+    p->osd_needs_enqueue = true;
+    p->perf.renders++;
+    int64_t elapsed = mp_time_ns() - start;
+    p->perf.total_ns += elapsed;
+    p->perf.max_ns = MPMAX(p->perf.max_ns, elapsed);
+    talloc_free(list);
+    return true;
+}
+
+// Frame-space OSD for compositing into video frames.
+static bool render_osd_buffer(struct vo *vo, struct sub_bitmap_list *list)
+{
+    struct priv *p = vo->priv;
     CVPixelBufferRef buf = create_empty_osd_pixel_buffer(vo);
     if (!buf || CVPixelBufferLockBaseAddress(buf, 0) != kCVReturnSuccess) {
         if (buf)
             CVPixelBufferRelease(buf);
-        talloc_free(list);
         return false;
     }
     void *base = CVPixelBufferGetBaseAddress(buf);
@@ -1046,12 +1125,10 @@ static bool render_osd_with_geometry(struct vo *vo, double pts,
     if (!base || !stride) {
         CVPixelBufferUnlockBaseAddress(buf, 0);
         CVPixelBufferRelease(buf);
-        talloc_free(list);
         return false;
     }
     CGContextRef cg = NULL;
     struct mp_rect bounds = {p->osd_w, p->osd_h, 0, 0};
-    int64_t start = mp_time_ns();
     for (int i = 0; i < list->num_items; i++) {
         struct sub_bitmaps *group = list->items[i];
         if (!draw_subtitle_bitmaps_direct(p, base, stride, p->osd_w, p->osd_h, group)) {
@@ -1067,7 +1144,6 @@ static bool render_osd_with_geometry(struct vo *vo, double pts,
                     osd_buf_record_dirty(p, buf, (struct mp_rect){0, 0, p->osd_w, p->osd_h});
                     CVPixelBufferUnlockBaseAddress(buf, 0);
                     CVPixelBufferRelease(buf);
-                    talloc_free(list);
                     return false;
                 }
             }
@@ -1088,14 +1164,6 @@ static bool render_osd_with_geometry(struct vo *vo, double pts,
     p->subtitle_x1 = bounds.x1;
     p->subtitle_y1 = bounds.y1;
     osd_buf_record_dirty(p, buf, bounds);
-    p->osd_change_id = list->change_id;
-    p->has_subtitle = true;
-    p->osd_needs_enqueue = true;
-    p->perf.renders++;
-    int64_t elapsed = mp_time_ns() - start;
-    p->perf.total_ns += elapsed;
-    p->perf.max_ns = MPMAX(p->perf.max_ns, elapsed);
-    talloc_free(list);
     return true;
 }
 
@@ -1750,6 +1818,9 @@ CVPixelBufferRef avf_composite_frame(struct vo *vo, CVPixelBufferRef videoBuffer
 void avf_clear_subtitle_cache(struct priv *p)
 {
     avf_subtitle_image_cache_clear(&p->subtitleImageCache);
+    [p->cachedSubtitleFrame release];
+    p->cachedSubtitleFrame = nil;
+    p->osd_frame_dropped = false;
     if (p->cachedSubtitleBuffer) {
         CVPixelBufferRelease(p->cachedSubtitleBuffer);
         p->cachedSubtitleBuffer = NULL;

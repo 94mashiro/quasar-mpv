@@ -134,6 +134,7 @@ struct avfoundation_opts {
 #define AVF_RATE_CHANGE_FRACTION  0.01
 
 @class QuasarSubtitleLayer;
+@class QuasarSubtitleFrame;
 
 struct priv {
     struct mp_hwdec_ctx hwctx;
@@ -160,6 +161,14 @@ struct priv {
     struct mp_osd_res osd_res;
     struct avf_render_geometry render_geometry;
     bool render_geometry_valid;
+    // Cached geometry was computed for the subtitle layer (not compositing).
+    bool render_geometry_inline;
+    // Subtitle layer pixel size in use; a new size is adopted once it has held
+    // for a moment, so live resizes don't rebuild the OSD pool every frame.
+    int render_layer_w, render_layer_h;
+    int pending_layer_w, pending_layer_h;
+    int64_t pending_layer_since_ns;
+
     CVPixelBufferPoolRef osdPool;
     int osd_pool_w, osd_pool_h;
     bool osd_needs_enqueue;
@@ -196,7 +205,10 @@ struct priv {
     CVPixelBufferPoolRef outputReservePool;
     int output_pool_w, output_pool_h;
     OSType output_pool_format;
-    CVPixelBufferRef cachedSubtitleBuffer;
+    CVPixelBufferRef cachedSubtitleBuffer;   // composited into frames
+    QuasarSubtitleFrame *cachedSubtitleFrame; // subtitle layer
+    bool osd_frame_dropped;     // this change_id's frame was too large
+    int redraw_layer_w, redraw_layer_h; // paused redraw requested for this size
     struct avf_subtitle_image_cache subtitleImageCache;
     bool overlay_matrix_valid;
     enum pl_color_primaries overlay_matrix_primaries;
@@ -416,15 +428,45 @@ static inline int64_t cm_time_to_ns(CMTime time)
     return converted.value;
 }
 
-// Subtitles over frames whose pixels must stay untouched (Dolby Vision RPU),
-// drawn on a transparent CAMetalLayer above the
-// display layer. Cues arrive as the timed BGRA samples the display layer
-// would get; a display link shows the newest one whose PTS the shared
-// timebase has reached. gain > 1 lifts opaque subtitle pixels into EDR
-// (1.0 = SDR white, capped at 2.0). Thread use: enqueue/flush/setGain from
-// the VO thread, everything touching the layer or Metal on main.
-// The OSD pool's cap (AVF_POOL_MAX_BUFFERS); the display link drains due
-// entries, so the queue only holds what the VO has queued ahead.
+// One subtitle frame as mpv rendered it: only the subtitle's own pixels (A8
+// masks from libass, premultiplied BGRA for image subtitles), positioned on a
+// w x h canvas. No canvas-sized buffer, so frames queued ahead for animated
+// ASS cost their glyph area only. Built on the VO thread, immutable after.
+// 32-bit fields only: the array is uploaded as is (QSubPart in the shader).
+struct qsub_part {
+    int32_t x, y, w, h;     // canvas pixels
+    int32_t dw, dh;         // drawn size; image subtitles may be scaled
+    int32_t stride;
+    uint32_t offset;        // into _pixels
+    uint32_t color;         // libass RGBA, A = transparency; masks only
+    uint32_t bgra;
+};
+
+@interface QuasarSubtitleFrame : NSObject {
+@public
+    int _w, _h;
+    int _count;             // -1: dropped (over QSUB_FRAME_MAX_BYTES or no memory)
+    id<MTLBuffer> _buffer;  // part table, then pixels; nil when empty
+    struct qsub_part *_parts;
+    uint8_t *_pixels;
+    size_t _pixelsOffset;
+    size_t _bytes;
+}
+- (instancetype)initWithList:(struct sub_bitmap_list *)list;
+@end
+
+// A full-screen 4K PGS page is 33 MB of BGRA; text is far below.
+#define QSUB_FRAME_MAX_BYTES (48 * 1024 * 1024)
+// All queued frames together; past it the oldest are dropped.
+#define QSUB_QUEUE_MAX_BYTES (64 * 1024 * 1024)
+
+// Subtitles drawn on a transparent CAMetalLayer above the display layer, in
+// screen pixels. Frames arrive with presentation timestamps; a display link
+// shows the newest one whose PTS the shared timebase has reached. gain > 1
+// lifts opaque subtitle pixels into EDR (1.0 = SDR white, capped at 2.0).
+// Thread use: enqueue/flush/setGain from the VO thread, everything touching
+// the layer or Metal on main. The display link drains due entries, so the
+// queue only holds what the VO has queued ahead.
 #define QSUB_QUEUE_MAX 32
 
 @interface QuasarSubtitleLayer : NSObject {
@@ -434,34 +476,49 @@ static inline int64_t cm_time_to_ns(CMTime time)
     CMTimebaseRef _timebase;
     id<MTLDevice> _device;
     id<MTLCommandQueue> _queue;
-    id<MTLRenderPipelineState> _pipeline;
-    CVMetalTextureCacheRef _textureCache;
+    // [hdr]: SDR draws into a BGRA8 sRGB drawable (half the memory of the
+    // RGBA16F one the EDR gain needs).
+    id<MTLRenderPipelineState> _pipelines[2];
+    // Display layer size in pixels, written on main whenever the layer's
+    // frame changes, read by the VO under _lock. The OSD is laid out at the
+    // video rect inside it. A change calls _wake (vo_wakeup) so a paused VO
+    // redraws at the new size; -invalidate clears it under _lock.
+    int _pixelW, _pixelH;
+    CGFloat _scale;
+    void (*_wake)(void *);
+    void *_wakeCtx;
     CADisplayLink *_link;
     // Picture in picture: the host marks the layer hosted (see
     // QuasarSubtitleMetalLayer). The app may be in the background, where
     // display links stop and Metal refuses command buffers, so cues are
-    // timed by a dispatch timer and shown as IOSurface contents of _cpuLayer.
+    // timed by a dispatch timer and drawn on the CPU into _cpuLayer.
     dispatch_source_t _timer;
     CALayer *_cpuLayer;
     bool _forceDraw;
     pthread_mutex_t _lock;
-    struct { int64_t pts_ns; CVPixelBufferRef buf; bool immediate; } _entries[QSUB_QUEUE_MAX];
+    struct { int64_t pts_ns; QuasarSubtitleFrame *frame; bool immediate; } _entries[QSUB_QUEUE_MAX];
     int _count;
+    size_t _queuedBytes;
     bool _clearPending;
     float _gain;
     float _appliedGain;
-    CVPixelBufferRef _current;
+    QuasarSubtitleFrame *_current;
     struct mp_log *_log;
     bool _loggedFirst;
 }
 - (instancetype)initWithTimebase:(CMTimebaseRef)timebase gain:(double)gain
-                             log:(struct mp_log *)log;
-- (void)enqueueSampleBuffer:(CMSampleBufferRef)buf;
+                             log:(struct mp_log *)log
+                            wake:(void (*)(void *))wake ctx:(void *)ctx;
+- (void)enqueueFrame:(QuasarSubtitleFrame *)frame pts:(int64_t)pts_ns
+           immediate:(bool)immediate;
 - (void)flushRemovingImage:(BOOL)remove;
 - (void)setGain:(double)gain;
 - (void)attachToDisplayLayer:(AVSampleBufferDisplayLayer *)displayLayer;
+- (void)getPixelWidth:(int *)w height:(int *)h;
 - (void)invalidate;
 - (void)hostedDidChange;
+- (void)redraw;
+- (void)updatePixelSize:(CALayer *)displayLayer;
 @end
 
 // Presentation pool capacity follows the scheduled queue, with three buffers for
@@ -474,15 +531,19 @@ void avf_update_avfoundation_geometry(struct vo *vo);
 
 void avf_sync_osd_layer_frame(struct vo *vo);
 
+// Paused: no frames flow, so a subtitle layer resize asks for one redraw.
+void avf_check_osd_layer_resize(struct vo *vo);
+
 void avf_reset_osd_buf_states(struct priv *p);
 
 void avf_prune_osd_buf_states(struct priv *p, int64_t now);
 
-CMSampleBufferRef avf_create_osd_sample_buffer(struct vo *vo,
-                                                  int64_t media_pts_ns,
-                                                  bool *needed);
+// The frame to enqueue on the subtitle layer with the next video sample, or
+// nil. *needed reports that one is due (a failed enqueue re-renders).
+QuasarSubtitleFrame *avf_create_osd_frame(struct vo *vo, bool *needed);
 
-bool avf_enqueue_osd_sample(struct vo *vo, CMSampleBufferRef buf);
+bool avf_enqueue_osd_frame(struct vo *vo, QuasarSubtitleFrame *frame,
+                           int64_t media_pts_ns);
 
 void avf_render_osd(struct vo *vo, double pts);
 

@@ -1016,7 +1016,7 @@ static void flip_page(struct vo *vo)
             // cannot drain. Replace equal-PTS image without blanking.
             sample_buffer_renderer_flush(p->displayLayer, false);
         }
-        CMSampleBufferRef osd_buf = NULL;
+        QuasarSubtitleFrame *osd_frame = nil;
         bool osd_needed = false;
 
         bool osd_layer = should_use_inline_osd_layer(p);
@@ -1025,7 +1025,7 @@ static void flip_page(struct vo *vo)
             // setup; CALayer tree changes happen on main.
             p->osdLayer = [[QuasarSubtitleLayer alloc]
                 initWithTimebase:p->timebase gain:p->opts->subtitle_edr_gain
-                             log:vo->log];
+                             log:vo->log wake:avfoundation_opts_wakeup ctx:vo];
             if (!p->osdLayer) {
                 MP_ERR(vo, "Failed to create the subtitle Metal layer\n");
                 p->osd_layer_failed = true;
@@ -1056,7 +1056,7 @@ static void flip_page(struct vo *vo)
         avf_render_osd(vo, p->next_pts);
 
         int64_t osd_pts_ns = sample_presentation_pts_ns(p);
-        osd_buf = avf_create_osd_sample_buffer(vo, osd_pts_ns, &osd_needed);
+        osd_frame = avf_create_osd_frame(vo, &osd_needed);
 
         int64_t t = mp_time_ns();
         CMSampleBufferRef video_buf = create_video_sample_buffer(vo, p->next_image);
@@ -1079,9 +1079,9 @@ static void flip_page(struct vo *vo)
             if (!p->presentation_host)
                 update_media_timebase_for_frame(vo);
 
-            if (osd_buf) {
+            if (osd_frame) {
                 t = mp_time_ns();
-                osd_enqueued = avf_enqueue_osd_sample(vo, osd_buf);
+                osd_enqueued = avf_enqueue_osd_frame(vo, osd_frame, osd_pts_ns);
                 p->perf.enqueue_ns += mp_time_ns() - t;
                 if (osd_enqueued) {
                     p->osd_needs_enqueue = false;
@@ -1103,8 +1103,7 @@ static void flip_page(struct vo *vo)
         if (osd_needed && !osd_enqueued)
             p->osd_change_id = 0;
 
-        if (osd_buf)
-            CFRelease(osd_buf);
+        [osd_frame release];
         if (video_buf)
             CFRelease(video_buf);
 
@@ -1296,6 +1295,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
         return VO_TRUE;
     case VOCTRL_CHECK_EVENTS:
         update_avfoundation_options(vo);
+        avf_check_osd_layer_resize(vo);
         return VO_TRUE;
     case VOCTRL_VO_OPTS_CHANGED:
         update_avfoundation_options(vo);
