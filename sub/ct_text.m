@@ -1022,13 +1022,33 @@ static void emit(struct ct_text *ct, const struct ct_text_frame *f, uint8_t *buf
         h = f->h - y0 - sy;
     if (w <= 0 || h <= 0 || (color & 0xFF) == 0xFF)
         return;
+    // Crop to the painted pixels, as libass does: --secondary-sub-stack
+    // stacks by bitmap rects, and the canvas padding would widen the gap.
+    const uint8_t *src = buf + (size_t)sy * c->stride + sx;
+    int top = h, bottom = -1, left = w, right = -1;
+    for (int y = 0; y < h; y++) {
+        const uint8_t *row = src + (size_t)y * c->stride;
+        int l = 0, r = w - 1;
+        while (l < w && !row[l])
+            l++;
+        if (l == w)
+            continue;
+        while (!row[r])
+            r--;
+        top = y < top ? y : top;
+        bottom = y;
+        left = l < left ? l : left;
+        right = r > right ? r : right;
+    }
+    if (bottom < 0)
+        return;
     struct ct_image *img = add_image(ct);
     if (!img)
         return;
     *img = (struct ct_image){
-        .w = w, .h = h, .stride = c->stride,
-        .bitmap = buf + (size_t)sy * c->stride + sx,
-        .color = color, .dst_x = x0 + sx, .dst_y = y0 + sy, .type = type,
+        .w = right - left + 1, .h = bottom - top + 1, .stride = c->stride,
+        .bitmap = src + (size_t)top * c->stride + left,
+        .color = color, .dst_x = x0 + sx + left, .dst_y = y0 + sy + top, .type = type,
     };
 }
 
