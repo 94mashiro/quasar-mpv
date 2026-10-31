@@ -40,7 +40,7 @@
 #include "ass_mp.h"
 #include "sd.h"
 #if HAVE_CORETEXT_SUBS
-#include "ct_text.h"
+#include "ct_mp.h"
 #endif
 
 struct sd_ass_priv {
@@ -872,43 +872,12 @@ static bool render_coretext(struct sd *sd, struct mp_osd_res *dim, ASS_Track *tr
     const char *texts[CT_MAX_EVENTS];
     for (int i = 0; i < n; i++)
         texts[i] = ev[i]->Text ? ev[i]->Text : "";
-    double vid_w = dim->w - dim->ml - dim->mr, vid_h = dim->h - dim->mt - dim->mb;
-    // Style values are in 720-line pixels (mp_ass_set_style()).
-    double u = vid_h / 720.0 * ctx->ct_font_scale;
-    bool xy = o->shadow_offset_x || o->shadow_offset_y;
     struct m_color *sec = &sd->shared_opts->secondary_sub_color;
-    struct ct_text_style st = {
-        .font = o->font,
-        .cjk_font = o->cjk_font,
-        .size = o->font_size * u,
-        .bold = o->bold,
-        .italic = o->italic,
-        .primary = MP_ASS_COLOR(sd->order == 1 && sec->a ? *sec : o->color),
-        .outline = MP_ASS_COLOR(o->outline_color),
-        .back = MP_ASS_COLOR(o->back_color),
-        .outline_w = o->outline_size * u,
-        .shadow_x = (xy ? o->shadow_offset_x : o->shadow_offset) * u,
-        .shadow_y = (xy ? o->shadow_offset_y : o->shadow_offset) * u,
-        .blur = o->blur * u,
-        .shadow_blur = o->shadow_blur * u,
-        .border_style = o->border_style,
-        .spacing = o->spacing * u,
-        .line_spacing = sd->opts->sub_line_spacing,
-        .align = 1 + (o->align_x + 1) + (o->align_y + 2) % 3 * 4,
-        .has_box = o->box_color.a > 0,
-        .box = MP_ASS_COLOR(o->box_color),
-        .box_padding = o->font_size * u * 0.2,
-    };
-    struct ct_text_frame f = {
-        .w = dim->w, .h = dim->h,
-        .ml = dim->ml, .mt = dim->mt, .mr = dim->mr, .mb = dim->mb,
-        .margin_l = lrint(o->margin_x * vid_w / 960.0),
-        .margin_r = lrint(o->margin_x * vid_w / 960.0),
-        .margin_v = lrint(o->margin_y * u),
-        .line_position = 100.0f - sd->shared_opts->sub_pos[sd->order],
-        .justify = o->justify,
-        .tag_scale = vid_h / MPMAX(track->PlayResY, 1) * ctx->ct_font_scale,
-    };
+    struct ct_text_style st;
+    struct ct_text_frame f;
+    ct_mp_params(o, *dim, ctx->ct_font_scale, sd->opts->sub_line_spacing,
+                 sd->shared_opts->sub_pos[sd->order],
+                 sd->order == 1 && sec->a ? *sec : o->color, track->PlayResY, &st, &f);
     const struct ct_image *img;
     int n_img;
     if (!ct_text_render(ctx->ct, &f, &st, texts, n, &img, &n_img, changed))

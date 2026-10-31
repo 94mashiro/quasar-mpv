@@ -847,7 +847,7 @@ coretext_subs = dependency('appleframeworks', modules: ['CoreFoundation', 'CoreG
 features += {'coretext-subs': coretext_subs.found()}
 if features['coretext-subs']
     dependencies += coretext_subs
-    sources += files('sub/ct_text.m')
+    sources += files('sub/ct_text.m', 'sub/ct_preview.c')
 endif
 
 coreaudio = dependency('appleframeworks', modules: ['CoreFoundation', 'CoreAudio',
@@ -1832,6 +1832,9 @@ if get_option('libmpv')
 
     headers = ['include/mpv/client.h', 'include/mpv/render.h',
                'include/mpv/render_gl.h', 'include/mpv/stream_cb.h']
+    if features['coretext-subs']
+        headers += ['include/mpv/quasar_subtitle.h']
+    endif
     install_headers(headers, subdir: 'mpv')
 
     # Allow projects to build with libmpv by cloning into ./subprojects/mpv
