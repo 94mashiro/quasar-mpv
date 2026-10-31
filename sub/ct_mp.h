@@ -52,7 +52,7 @@ static inline void ct_mp_params(const struct osd_style_opts *o, struct mp_osd_re
         .border_style = o->border_style,
         .spacing = o->spacing * u,
         .line_spacing = line_spacing,
-        .align = 1 + (o->align_x + 1) + (o->align_y + 2) % 3 * 4,
+        .align = o->align_x + 2 + (1 - o->align_y) * 3,    // \an numpad
         .has_box = o->box_color.a > 0,
         .box = MP_ASS_COLOR(o->box_color),
         .box_padding = o->font_size * u * 0.2,
@@ -62,7 +62,7 @@ static inline void ct_mp_params(const struct osd_style_opts *o, struct mp_osd_re
         .ml = dim.ml, .mt = dim.mt, .mr = dim.mr, .mb = dim.mb,
         .margin_l = lrint(o->margin_x * vid_w / 960.0),
         .margin_r = lrint(o->margin_x * vid_w / 960.0),
-        .margin_v = lrint(o->margin_y * u),
+        .margin_v = lrint(o->margin_y * vid_h / 720.0),   // libass: not font-scaled
         .line_position = 100.0f - sub_pos,
         .justify = o->justify,
         .tag_scale = vid_h / (playres_y > 0 ? playres_y : MP_ASS_FONT_PLAYRESY) * font_scale,

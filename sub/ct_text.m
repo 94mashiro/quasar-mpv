@@ -20,6 +20,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreText/CoreText.h>
+#include <dispatch/dispatch.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,8 +47,8 @@ static CFStringRef const kPx = CFSTR("qct.px");
 enum { F_UNDERLINE = 1, F_STRIKE = 2, F_FAKE_BOLD = 4 };
 
 struct ct_text {
-    uint64_t hash;
-    bool valid;
+    uint64_t hash, failed;
+    bool valid, has_failed;
     struct ct_image *images;
     int n_images, cap_images;
     uint8_t **bufs;
@@ -177,13 +178,14 @@ static bool has_cjk(CTFontRef font)
 static double system_cap_ratio(void)
 {
     static double ratio;
-    if (!ratio) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
         CTFontRef sys = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 100, NULL);
         double h = sys ? hanzi_height(sys) : 0;
         ratio = h > 0 ? CTFontGetCapHeight(sys) / h : 0.81;
         if (sys)
             CFRelease(sys);
-    }
+    });
     return ratio;
 }
 
@@ -823,11 +825,14 @@ static void place_blocks(struct block *bl, int n, const struct ct_text_frame *f)
             mid_h += bl[i].h;
     }
     double mid = f->mt + (vid_h - mid_h) / 2;
+    bool lifted = false;
     for (int i = 0; i < n; i++) {
         struct block *b = &bl[i];
         int row = (b->align - 1) / 3;   // 0 bottom, 1 middle, 2 top
         if (row == 0) {
-            double lift = f->line_position / 100.0 * (vid_h - 2 * f->margin_v - b->h);
+            // The lowest event moves up; the rest stack on it.
+            double lift = lifted ? 0 : f->line_position / 100.0 * (vid_h - 2 * f->margin_v - b->h);
+            lifted = true;
             b->y = bottom - b->h - fmax(0, lift);
             bottom = b->y;
         } else if (row == 2) {
@@ -1043,8 +1048,11 @@ static int run_colors(const struct block *b, CFStringRef key, uint32_t *out, int
             bool seen = false;
             for (int k = 0; k < n; k++)
                 seen |= out[k] == c;
-            if (!seen && n < max)
+            if (!seen) {
+                if (n == max)
+                    return -1;  // more colors than masks: libass draws it
                 out[n++] = c;
+            }
         }
     }
     return n;
@@ -1095,6 +1103,8 @@ static bool render_block(struct ct_text *ct, const struct ct_text_frame *f,
     uint32_t colors[MAX_COLORS];
     if (st->outline_w > 0 && st->border_style != 4) {
         int nc = box ? 1 : run_colors(b, kOutline, colors, MAX_COLORS);
+        if (nc < 0)
+            return false;
         if (box)
             colors[0] = st->outline;
         for (int i = 0; i < nc; i++) {
@@ -1106,6 +1116,8 @@ static bool render_block(struct ct_text *ct, const struct ct_text_frame *f,
         }
     }
     int nc = run_colors(b, kPrimary, colors, MAX_COLORS);
+    if (nc < 0)
+        return false;
     for (int i = 0; i < nc; i++) {
         uint8_t *buf = alloc_buf(ct, size);
         if (!buf)
@@ -1123,7 +1135,7 @@ static bool render_block(struct ct_text *ct, const struct ct_text_frame *f,
 
     // Shadow: the outline (or body) shape, offset, in the back color.
     int dx = (int)lround(st->shadow_x), dy = (int)lround(st->shadow_y);
-    if ((dx || dy) && st->border_style != 4) {
+    if ((dx || dy || lround(st->shadow_blur) > 0) && st->border_style != 4) {
         uint32_t back = box ? st->back : 0;
         for (int i = 0; i < n_blurred; i++) {
             uint8_t *src = blurred[i].buf;
@@ -1166,9 +1178,15 @@ bool ct_text_render(struct ct_text *ct, const struct ct_text_frame *f,
 {
     uint64_t h = 0xcbf29ce484222325ULL;
     h = fnv(h, f, sizeof(*f));
-    struct ct_text_style key = *st;
-    key.font = key.cjk_font = NULL;
-    h = fnv(h, &key, sizeof(key));
+    // Field by field: struct padding is indeterminate.
+#define HASH(x) h = fnv(h, &(x), sizeof(x))
+    HASH(st->size); HASH(st->bold); HASH(st->italic);
+    HASH(st->primary); HASH(st->outline); HASH(st->back);
+    HASH(st->outline_w); HASH(st->shadow_x); HASH(st->shadow_y);
+    HASH(st->blur); HASH(st->shadow_blur); HASH(st->border_style);
+    HASH(st->spacing); HASH(st->line_spacing); HASH(st->align);
+    HASH(st->has_box); HASH(st->box); HASH(st->box_padding);
+#undef HASH
     h = fnv_str(h, st->font);
     h = fnv_str(h, st->cjk_font);
     for (int i = 0; i < n; i++)
@@ -1179,6 +1197,8 @@ bool ct_text_render(struct ct_text *ct, const struct ct_text_frame *f,
         *changed = 0;
         return true;
     }
+    if (ct->has_failed && h == ct->failed)
+        return false;
 
     struct block *blocks = n ? calloc(n, sizeof(*blocks)) : NULL;
     if (n && !blocks)
@@ -1202,6 +1222,8 @@ bool ct_text_render(struct ct_text *ct, const struct ct_text_frame *f,
     free(blocks);
     if (!ok) {
         ct->valid = false;
+        ct->has_failed = true;
+        ct->failed = h;
         return false;
     }
     ct->hash = h;
