@@ -39,6 +39,9 @@
 #include "dec_sub.h"
 #include "ass_mp.h"
 #include "sd.h"
+#if HAVE_CORETEXT_SUBS
+#include "ct_text.h"
+#endif
 
 struct sd_ass_priv {
     struct ass_library *ass_library;
@@ -65,6 +68,12 @@ struct sd_ass_priv {
     bool check_animated;
     struct text_event_metadata *text_event_metadata;
     int num_text_event_metadata;
+#if HAVE_CORETEXT_SUBS
+    struct ct_text *ct;
+    ASS_Image *ct_images;
+    float ct_font_scale;    // configure_ass()'s libass font scale
+    bool ct_last;           // the last frame came from CoreText
+#endif
 };
 
 struct text_event_metadata {
@@ -704,6 +713,9 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
                          track->PlayResY, opts->sub_style);
     }
     ass_set_font_scale(priv, set_font_scale);
+#if HAVE_CORETEXT_SUBS
+    ctx->ct_font_scale = set_font_scale;
+#endif
     ass_set_hinting(priv, set_hinting);
     ass_set_line_spacing(priv, set_line_spacing);
 #if LIBASS_VERSION >= 0x01600010
@@ -827,6 +839,95 @@ static long long find_timestamp(struct sd *sd, double pts)
 
 #undef END
 
+#if HAVE_CORETEXT_SUBS
+#define CT_MAX_EVENTS 16
+
+// --sub-text-renderer=coretext: the events showing at ts, through CoreText
+// with libass's sizes and placement (configure_ass() for converted text).
+// False leaves the frame to libass.
+static bool render_coretext(struct sd *sd, struct mp_osd_res *dim, ASS_Track *track,
+                            long long ts, ASS_Image **out, int *changed)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    struct osd_style_opts *o = sd->opts->sub_style;
+    if (!ctx->ct && !(ctx->ct = ct_text_create()))
+        return false;
+    ASS_Event *ev[CT_MAX_EVENTS];
+    int n = 0;
+    for (int i = 0; i < track->n_events; i++) {
+        ASS_Event *e = &track->events[i];
+        if (ts < e->Start || ts >= e->Start + e->Duration)
+            continue;
+        if (n == CT_MAX_EVENTS)
+            return false;
+        // Layer, then read order, as libass stacks them.
+        int k = n++;
+        while (k > 0 && (ev[k - 1]->Layer > e->Layer ||
+                         (ev[k - 1]->Layer == e->Layer && ev[k - 1]->ReadOrder > e->ReadOrder))) {
+            ev[k] = ev[k - 1];
+            k--;
+        }
+        ev[k] = e;
+    }
+    const char *texts[CT_MAX_EVENTS];
+    for (int i = 0; i < n; i++)
+        texts[i] = ev[i]->Text ? ev[i]->Text : "";
+    double vid_w = dim->w - dim->ml - dim->mr, vid_h = dim->h - dim->mt - dim->mb;
+    // Style values are in 720-line pixels (mp_ass_set_style()).
+    double u = vid_h / 720.0 * ctx->ct_font_scale;
+    bool xy = o->shadow_offset_x || o->shadow_offset_y;
+    struct m_color *sec = &sd->shared_opts->secondary_sub_color;
+    struct ct_text_style st = {
+        .font = o->font,
+        .cjk_font = o->cjk_font,
+        .size = o->font_size * u,
+        .bold = o->bold,
+        .italic = o->italic,
+        .primary = MP_ASS_COLOR(sd->order == 1 && sec->a ? *sec : o->color),
+        .outline = MP_ASS_COLOR(o->outline_color),
+        .back = MP_ASS_COLOR(o->back_color),
+        .outline_w = o->outline_size * u,
+        .shadow_x = (xy ? o->shadow_offset_x : o->shadow_offset) * u,
+        .shadow_y = (xy ? o->shadow_offset_y : o->shadow_offset) * u,
+        .blur = o->blur * u,
+        .shadow_blur = o->shadow_blur * u,
+        .border_style = o->border_style,
+        .spacing = o->spacing * u,
+        .line_spacing = sd->opts->sub_line_spacing,
+        .align = 1 + (o->align_x + 1) + (o->align_y + 2) % 3 * 4,
+        .has_box = o->box_color.a > 0,
+        .box = MP_ASS_COLOR(o->box_color),
+        .box_padding = o->font_size * u * 0.2,
+    };
+    struct ct_text_frame f = {
+        .w = dim->w, .h = dim->h,
+        .ml = dim->ml, .mt = dim->mt, .mr = dim->mr, .mb = dim->mb,
+        .margin_l = lrint(o->margin_x * vid_w / 960.0),
+        .margin_r = lrint(o->margin_x * vid_w / 960.0),
+        .margin_v = lrint(o->margin_y * u),
+        .line_position = 100.0f - sd->shared_opts->sub_pos[sd->order],
+        .justify = o->justify,
+        .tag_scale = vid_h / MPMAX(track->PlayResY, 1) * ctx->ct_font_scale,
+    };
+    const struct ct_image *img;
+    int n_img;
+    if (!ct_text_render(ctx->ct, &f, &st, texts, n, &img, &n_img, changed))
+        return false;
+    // As a libass image list for the packer.
+    MP_TARRAY_GROW(ctx, ctx->ct_images, n_img);
+    for (int i = 0; i < n_img; i++) {
+        ctx->ct_images[i] = (ASS_Image){
+            .w = img[i].w, .h = img[i].h, .stride = img[i].stride,
+            .bitmap = (unsigned char *)img[i].bitmap, .color = img[i].color,
+            .dst_x = img[i].dst_x, .dst_y = img[i].dst_y,
+            .next = i + 1 < n_img ? &ctx->ct_images[i + 1] : NULL,
+        };
+    }
+    *out = n_img ? ctx->ct_images : NULL;
+    return true;
+}
+#endif
+
 static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
                                        int format, double pts)
 {
@@ -897,7 +998,21 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
         fill_plaintext(sd, pts);
 
     int changed;
-    ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
+    ASS_Image *imgs = NULL;
+    bool ct = false;
+#if HAVE_CORETEXT_SUBS
+    if (converted && opts->sub_text_renderer == 1)
+        ct = render_coretext(sd, &dim, track, ts, &imgs, &changed);
+    // The packer caches the other renderer's last frame.
+    bool switched = ct != ctx->ct_last;
+    ctx->ct_last = ct;
+#endif
+    if (!ct)
+        imgs = ass_render_frame(renderer, track, ts, &changed);
+#if HAVE_CORETEXT_SUBS
+    if (switched)
+        changed = 2;
+#endif
 #if LIBASS_VERSION >= 0x01703010
     if (prune && track != ctx->ass_track)
         ass_prune_events(ctx->ass_track, prune_deadline);
@@ -1177,6 +1292,9 @@ static void uninit(struct sd *sd)
     if (ctx->converter)
         lavc_conv_uninit(ctx->converter);
     assobjects_destroy(sd);
+#if HAVE_CORETEXT_SUBS
+    ct_text_destroy(ctx->ct);
+#endif
     talloc_free(ctx->copy_cache);
 }
 

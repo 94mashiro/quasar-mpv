@@ -3046,6 +3046,38 @@ Subtitles
     before the font provider's own fallback. The default is empty, meaning
     ``--sub-font`` itself.
 
+``--sub-text-renderer=<libass|coretext>``
+    Renderer for plain text subtitles (SRT, WebVTT, mov_text and other
+    formats converted to ASS without styling). ``coretext`` (Apple platforms
+    only) lays them out with CoreText: system fonts and CoreText's font
+    fallback, the system font for ``--sub-font=sans-serif`` or
+    ``system-ui``, and a CJK-Latin gap. Sizes, colors, borders, shadows and
+    placement follow the ``--sub-*`` style options as with libass. Lines
+    using ASS positioning, animation, drawing or karaoke tags are rendered
+    with libass. ASS subtitles always use libass. Default: ``libass``.
+
+``--sub-cjk-font=<name>``
+    With ``--sub-text-renderer=coretext``, the font family for CJK
+    characters. The default is empty: ``--sub-font``'s own fallback.
+
+``--sub-box-color=<color>``
+    With ``--sub-text-renderer=coretext``, a box of this color behind each
+    subtitle, padded by a fifth of the font size, independent of
+    ``--sub-border-style``. Fully transparent (the default) draws none.
+
+``--secondary-sub-color=<color>``
+    With ``--sub-text-renderer=coretext``, the text color of secondary
+    subtitles. Fully transparent (the default) uses ``--sub-color``.
+
+``--sub-shadow-blur=<0..20.0>``
+    With ``--sub-text-renderer=coretext``, extra blur for the shadow only,
+    in the units of ``--sub-shadow-offset``.
+
+``--sub-shadow-offset-x=<px>``, ``--sub-shadow-offset-y=<px>``
+    With ``--sub-text-renderer=coretext``, separate horizontal and vertical
+    shadow offsets. When both are 0, ``--sub-shadow-offset`` is used for
+    both.
+
 ``--sub-font-size=<size>``
     Specify the sub font size. The unit is the size in scaled pixels at a
     window height of 720. The actual pixel size is scaled with the window

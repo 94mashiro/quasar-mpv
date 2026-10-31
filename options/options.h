@@ -98,6 +98,7 @@ struct mp_subtitle_opts {
     float sub_fps;
     float sub_speed;
     bool sub_text_intercept;
+    int sub_text_renderer;
     bool sub_forced_events_only;
     bool stretch_dvd_subs;
     bool stretch_image_subs;
@@ -144,6 +145,7 @@ struct mp_subtitle_shared_opts {
     bool sub_visibility[2];
     int ass_style_override[2];
     float secondary_sub_scale;
+    struct m_color secondary_sub_color;
 };
 
 struct mp_osd_render_opts {

@@ -841,6 +841,15 @@ if features['vo-avfoundation']
                      'video/out/avfoundation_subtitle_layer.m')
 endif
 
+# --sub-text-renderer=coretext
+coretext_subs = dependency('appleframeworks', modules: ['CoreFoundation', 'CoreGraphics',
+                           'CoreText'], required: false)
+features += {'coretext-subs': coretext_subs.found()}
+if features['coretext-subs']
+    dependencies += coretext_subs
+    sources += files('sub/ct_text.m')
+endif
+
 coreaudio = dependency('appleframeworks', modules: ['CoreFoundation', 'CoreAudio',
                        'AudioUnit', 'AudioToolbox'], required: get_option('coreaudio'))
 features += {'coreaudio': coreaudio.found()}

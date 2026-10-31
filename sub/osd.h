@@ -157,6 +157,11 @@ struct osd_style_opts {
     int justify;
     int font_provider;
     char *fonts_dir;
+    // --sub-text-renderer=coretext only.
+    char *cjk_font;
+    struct m_color box_color;
+    float shadow_blur;
+    float shadow_offset_x, shadow_offset_y;
 };
 
 struct osd_bar_style_opts {

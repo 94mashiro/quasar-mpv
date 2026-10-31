@@ -75,6 +75,11 @@ static const m_option_t style_opts[] = {
         {"auto", 0}, {"none", 1}, {"fontconfig", 2}), .flags = UPDATE_SUB_HARD},
     {"fonts-dir", OPT_STRING(fonts_dir),
         .flags = M_OPT_FILE | UPDATE_SUB_HARD},
+    {"cjk-font", OPT_STRING(cjk_font)},
+    {"box-color", OPT_COLOR(box_color)},
+    {"shadow-blur", OPT_FLOAT(shadow_blur), M_RANGE(0, 20)},
+    {"shadow-offset-x", OPT_FLOAT(shadow_offset_x)},
+    {"shadow-offset-y", OPT_FLOAT(shadow_offset_y)},
     {0}
 };
 
