@@ -62,7 +62,7 @@ static inline void ct_mp_params(const struct osd_style_opts *o, struct mp_osd_re
         .ml = dim.ml, .mt = dim.mt, .mr = dim.mr, .mb = dim.mb,
         .margin_l = lrint(o->margin_x * vid_w / 960.0),
         .margin_r = lrint(o->margin_x * vid_w / 960.0),
-        .margin_v = lrint(o->margin_y * vid_h / 720.0),   // libass: not font-scaled
+        .margin_v = lrint(o->margin_y * u),   // font-scaled, as sd_ass.c's override_playres
         .line_position = 100.0f - sub_pos,
         .justify = o->justify,
         .tag_scale = vid_h / (playres_y > 0 ? playres_y : MP_ASS_FONT_PLAYRESY) * font_scale,
