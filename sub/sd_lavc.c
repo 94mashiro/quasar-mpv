@@ -546,10 +546,11 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
         }
     }
 
-    // --secondary-sub-scale 对图形副字幕：整组以外包框底边中点为锚缩放，贴底位置不变，
+    // --sub-image-scale 和 --secondary-sub-scale 对图形字幕：整组以外包框底边中点为锚缩放，贴底位置不变，
     // 多块位图之间的相对位置也跟着缩
     // ponytail: 同一条里既有顶部标牌又有底部对白时，标牌会往下、往中间挪；要时按簇各自以底边中点缩放
-    float secondary_scale = sd->order == 1 ? shared_opts->secondary_sub_scale : 1.0f;
+    float secondary_scale = (sd->order == 1 ? shared_opts->secondary_sub_scale : 1.0f) *
+                            opts->sub_image_scale;
     if (secondary_scale != 1.0f && res->num_parts > 0) {
         int x0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
         for (int n = 0; n < res->num_parts; n++) {

@@ -3056,6 +3056,10 @@ Subtitles
     using ASS positioning, animation, drawing or karaoke tags are rendered
     with libass. ASS subtitles always use libass. Default: ``libass``.
 
+``--sub-image-scale=<0.1-10>``
+    Scale image subtitles (PGS, VobSub, DVB) around the bottom center of
+    each subtitle, without changing text subtitles. Default: 1.
+
 ``--sub-cjk-font=<name>``
     With ``--sub-text-renderer=coretext``, the font family for CJK
     characters. The default is empty: ``--sub-font``'s own fallback.

@@ -99,6 +99,7 @@ struct mp_subtitle_opts {
     float sub_speed;
     bool sub_text_intercept;
     int sub_text_renderer;
+    float sub_image_scale;
     bool sub_forced_events_only;
     bool stretch_dvd_subs;
     bool stretch_image_subs;
